@@ -459,24 +459,23 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
     // 对外鉴权：GATEWAY_TOKEN / OAuth token(abot_)
     const auth = request.headers.get("Authorization") || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    let authed = false;
     let agentEmail = null;
-    if (env.GATEWAY_TOKEN && token === env.GATEWAY_TOKEN) {
-      authed = true;
-    } else if (token.startsWith("abot_")) {
+    if (token.startsWith("abot_")) {
       await ensureOAuthTables(env);
       const row = await env.DB.prepare("SELECT email FROM gw_oauth_tokens WHERE token=?").bind(token).first();
-      if (row) {
-        authed = true;
-        agentEmail = row.email || null;
+      if (row && row.email) {
+        agentEmail = row.email;
       }
     }
-    if (!authed) {
+    if (!agentEmail) {
       return Response.json({ error: "unauthorized" }, { status: 401 });
     }
 
     // ---- 统一 MCP 网关：POST /mcp ----
     if (path === "/mcp" && request.method === "POST") {
+      if (!agentEmail) {
+        return Response.json({ jsonrpc: "2.0", error: { code: -32001, message: "agent email not bound" } }, { status: 401 });
+      }
       try {
         const rpc = await request.json();
         const method = rpc.method;
@@ -497,7 +496,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
             "Content-Type": "application/json",
             "X-Internal-Token": token,
           };
-          if (agentEmail) headers["X-Abot-Owner-Email"] = agentEmail;
+          headers["X-Abot-Owner-Email"] = agentEmail;
           const resp = await fetch(svc.route.host + "/mcp", {
             method: "POST",
             headers,
@@ -598,9 +597,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
     const headers = new Headers(request.headers);
     headers.set("X-Internal-Token", internalToken);
     // agent 身份透传（后端信任此头做隔离）
-    if (agentEmail) {
-      headers.set("X-Abot-Owner-Email", agentEmail);
-    }
+    headers.set("X-Abot-Owner-Email", agentEmail);
     // 移除外部 Authorization，后端只认内部 token + 身份头
     headers.delete("Authorization");
 
