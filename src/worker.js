@@ -15,8 +15,8 @@
 const ROUTES = {
   "/data/": { host: "https://data.abot.run", token_env: "INTERNAL_DATA" },
   "/mail/": { host: "https://mail.abot.run", token_env: "INTERNAL_MAIL" },
-  "/health/": { host: "https://health.abot.run", token_env: "INTERNAL_HEALTH" },
-  "/rules/": { host: null, token_env: "INTERNAL_RULES" }, // 动态填 workers.dev
+  "/health/": { host: "https://abot-health.boliam.workers.dev", token_env: "INTERNAL_HEALTH" },
+  "/rules/": { host: "https://abot-rules.boliam.workers.dev", token_env: "INTERNAL_RULES" },
   "/secrets/": { host: "https://secrets.abot.run", token_env: "INTERNAL_SECRETS" },
 };
 
@@ -50,15 +50,8 @@ export default {
       return Response.json({ error: "unknown service, use /data/, /mail/, /health/, /rules/, /secrets/" }, { status: 404 });
     }
 
-    // 解析目标 host
-    let targetHost = route.host;
-    if (!targetHost) {
-      // rules 用 workers.dev（从 env 读）
-      targetHost = env.RULES_HOST;
-      if (!targetHost) {
-        return Response.json({ error: "rules backend not configured" }, { status: 502 });
-      }
-    }
+    // 解析目标 host（均为 workers.dev 或自有域名内部直连）
+    const targetHost = route.host;
 
     // 内部 token
     const internalToken = env[route.token_env];
