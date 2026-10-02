@@ -73,8 +73,17 @@ export default {
 
     // DCR：动态客户端注册
     if (path === "/oauth/register" && request.method === "POST") {
-      await ensureOAuthTables(env);
-      const body = await request.json();
+      try {
+        await ensureOAuthTables(env);
+      } catch (e) {
+        return Response.json({ error: "db_error", detail: String(e && e.message || e) }, { status: 500 });
+      }
+      let body;
+      try {
+        body = await request.json();
+      } catch {
+        return Response.json({ error: "invalid_request", detail: "body must be JSON" }, { status: 400 });
+      }
       const redirectUris = body.redirect_uris || [];
       if (!Array.isArray(redirectUris) || redirectUris.length === 0) {
         return Response.json({ error: "invalid_redirect_uri" }, { status: 400 });
