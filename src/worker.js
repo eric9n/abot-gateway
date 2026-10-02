@@ -1,29 +1,9 @@
-/**
- * abot-gateway v2 — MCP 统一网关 + OAuth
- *
- * 对外：abot.run，OAuth 2.0（DCR）+ Bearer token 鉴权
- * 对内：按路径路由到各后端，带 X-Internal-Token
- *
- * 路由：
- *   /data/*    → abot-data
- *   /mail/*    → abot-mail
- *   /health/*  → abot-health
- *   /rules/*   → abot-rules
- *   /secrets/* → abot-secrets
- *
- * OAuth：
- *   /.well-known/oauth-authorization-server
- *   /oauth/register (DCR)
- *   /oauth/authorize (GET 显示授权页，POST 确认)
- *   /oauth/token (code 换 token)
- */
-
 const ROUTES = {
-  "/data/": { host: "https://data.abot.run", token_env: "INTERNAL_DATA" },
-  "/mail/": { host: "https://mail.abot.run", token_env: "INTERNAL_MAIL" },
+  "/data/": { host: "https://abot-data.boliam.workers.dev", token_env: "INTERNAL_DATA" },
+  "/mail/": { host: "https://resend-agent-mail-relay.boliam.workers.dev", token_env: "INTERNAL_MAIL" },
   "/health/": { host: "https://abot-health.boliam.workers.dev", token_env: "INTERNAL_HEALTH" },
   "/rules/": { host: "https://abot-rules.boliam.workers.dev", token_env: "INTERNAL_RULES" },
-  "/secrets/": { host: "https://secrets.abot.run", token_env: "INTERNAL_SECRETS" },
+  "/secrets/": { host: "https://abot-secrets.boliam.workers.dev", token_env: "INTERNAL_SECRETS" },
 };
 
 function newId(prefix) {
@@ -35,6 +15,7 @@ async function ensureOAuthTables(env) {
     client_id TEXT PRIMARY KEY, redirect_uris TEXT NOT NULL,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS gw_oauth_codes (
+    email TEXT,
     code TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
     code_challenge TEXT, expires_at INTEGER NOT NULL)`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS gw_oauth_tokens (
@@ -141,29 +122,47 @@ export default {
       }
 
       if (request.method === "GET") {
-        // 显示授权确认页
+        // 显示登录+授权页
         return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 授权</title>
 <style>body{font-family:system-ui;max-width:480px;margin:60px auto;padding:20px}
-button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;border-radius:8px;cursor:pointer}</style>
+input{display:block;width:100%;padding:10px;margin:8px 0;font-size:15px;border:1px solid #ccc;border-radius:6px;box-sizing:border-box}
+button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;border-radius:8px;cursor:pointer;margin-top:12px}</style>
 </head><body>
 <h2>aBot 网关授权</h2>
-<p>客户端 <code>${clientId}</code> 请求访问你的 aBot 服务（健康/邮件/数据/规则）。</p>
+<p>客户端 <code>${clientId}</code> 请求访问你的 aBot 服务。</p>
+<p style="color:#666">请输入你的 agent 邮箱和 Secret（在 admin 页获取）。</p>
 <form method="POST">
 <input type="hidden" name="client_id" value="${clientId}">
 <input type="hidden" name="redirect_uri" value="${redirectUri}">
 <input type="hidden" name="state" value="${state}">
 <input type="hidden" name="code_challenge" value="${codeChallenge}">
-<button type="submit">允许访问</button>
+<input type="email" name="email" placeholder="agent@abot.run" required>
+<input type="password" name="secret" placeholder="ask_..." required>
+<button type="submit">登录并授权</button>
 </form></body></html>`, { headers: { "Content-Type": "text/html;charset=utf-8" } });
       }
 
       if (request.method === "POST") {
         const form = await request.formData();
+        // 验证邮箱+secret
+        const email = (form.get("email") || "").trim().toLowerCase();
+        const secret = (form.get("secret") || "").trim();
+        if (!email || !secret) {
+          return new Response("需要邮箱和 Secret", { status: 400 });
+        }
+        const secretHash = await sha256hex(secret);
+        const tokenRow = await env.DB.prepare(
+          "SELECT email FROM agent_tokens WHERE token_hash=? AND revoked_at IS NULL"
+        ).bind(secretHash).first();
+        if (!tokenRow || tokenRow.email !== email) {
+          return new Response("<html><body><h2>邮箱或 Secret 错误</h2><p><a href='javascript:history.back()'>返回重试</a></p></body></html>", 
+            { status: 401, headers: { "Content-Type": "text/html;charset=utf-8" } });
+        }
         const code = newId("code");
-        const expiresAt = Date.now() + 10 * 60 * 1000; // 10 分钟
+        const expiresAt = Date.now() + 10 * 60 * 1000;
         await env.DB.prepare(
-          "INSERT INTO gw_oauth_codes (code, client_id, redirect_uri, code_challenge, expires_at) VALUES (?,?,?,?,?)"
-        ).bind(code, clientId, redirectUri, codeChallenge || null, expiresAt).run();
+          "INSERT INTO gw_oauth_codes (code, client_id, redirect_uri, code_challenge, expires_at, email) VALUES (?,?,?,?,?,?)"
+        ).bind(code, clientId, redirectUri, codeChallenge || null, expiresAt, email).run();
         const dest = new URL(redirectUri);
         dest.searchParams.set("code", code);
         if (state) dest.searchParams.set("state", state);
@@ -219,10 +218,10 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       }
       // 删除已用的 code
       await env.DB.prepare("DELETE FROM gw_oauth_codes WHERE code=?").bind(code).run();
-      // 发 token
+      // 发 token（绑定邮箱）
       const token = "abot_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-      await env.DB.prepare("INSERT INTO gw_oauth_tokens (token, created_at) VALUES (?,?)")
-        .bind(token, Date.now()).run();
+      await env.DB.prepare("INSERT INTO gw_oauth_tokens (token, email, created_at) VALUES (?,?,?)")
+        .bind(token, row.email || null, Date.now()).run();
       return Response.json({ access_token: token, token_type: "Bearer", expires_in: 31536000 });
     }
 
@@ -318,24 +317,18 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
           <span style="color:#999;font-size:12px">${c.created_at}</span>
         </div>`
       ).join("");
+      const formBase = (url.hostname === "admin.abot.run") ? "" : "/admin";
       // 已批准的 agent 列表
       const agents = await env.DB.prepare(
         "SELECT id, agent_name, email, created_at FROM provision_requests WHERE status='approved' AND email IS NOT NULL ORDER BY created_at DESC"
       ).all();
       const agentItems = (agents.results || []).map((a, i) =>
-        `<div style="display:flex;align-items:center;gap:8px;margin:6px 0;padding:8px;border:1px solid #ddd;border-radius:6px">
+        `<div class="agent-row" style="display:flex;align-items:center;gap:8px;margin:6px 0;padding:8px;border:1px solid #ddd;border-radius:6px">
           <div style="flex:1"><b>${a.agent_name || "(未命名)"}</b><br><code>${a.email}</code></div>
-          <form method="POST" action="${formBase}/rotate" style="display:inline">
-            <input type="hidden" name="id" value="${a.id}">
-            <button style="padding:4px 12px;font-size:12px">换 Secret</button>
-          </form>
-          <form method="POST" action="${formBase}/revoke" style="display:inline">
-            <input type="hidden" name="id" value="${a.id}">
-            <button style="padding:4px 12px;font-size:12px;background:#ffebee">吊销</button>
-          </form>
+          <button data-action="rotate" data-id="${a.id}" style="padding:4px 12px;font-size:12px">换 Secret</button>
+          <button data-action="revoke" data-id="${a.id}" style="padding:4px 12px;font-size:12px;background:#ffebee">吊销</button>
         </div>`
       ).join("");
-      const formBase = (url.hostname === "admin.abot.run") ? "" : "/admin";
       const items = (rows.results || []).map((r) =>
         `<div style="border:1px solid #ddd;border-radius:8px;padding:12px;margin:8px 0">
           <b>${r.agent_name || "(未命名)"}</b> <span style="color:#666">${r.id}</span><br>
@@ -343,19 +336,16 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
           <span>状态: ${r.status}</span> <span style="color:#999">${r.created_at}</span><br>
           ${r.status === "approved" && r.email ? `<span style="color:#2e7d32">邮箱: ${r.email}</span><br>` : ""}
           ${r.status === "pending" ? `
-            <form method="POST" action="${formBase}/approve" style="margin-top:8px">
-              <input type="hidden" name="id" value="${r.id}">
+            <div class="req-row" style="margin-top:8px">
               ${r.requested_email ? `<span style="color:#666">申请想要：${r.requested_email}</span><br>` : ""}
-              <input type="text" name="email" placeholder="agent_xxx@abot.run" value="${r.requested_email || ""}" style="padding:6px;width:220px" required>
-              <button>通过并建邮箱</button>
-            </form>
-            <form method="POST" action="${formBase}/deny" style="display:inline">
-              <input type="hidden" name="id" value="${r.id}">
-              <button>拒绝</button>
-            </form>` : ""}
+              <button data-action="approve" data-id="${r.id}">通过并建邮箱</button>
+              <button data-action="deny" data-id="${r.id}">拒绝</button>
+            </div>` : ""}
         </div>`
       ).join("");
-      return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 审核</title>
+      return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 审核</title><script>
+/*__ADMIN_JS__*/
+</script>
 <style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:20px}
 button{padding:8px 20px;margin:4px;font-size:14px;cursor:pointer}
 .newcode{background:#e8f5e9;border:1px solid #4caf50;border-radius:8px;padding:12px;margin:12px 0;word-break:break-all}</style>
@@ -373,8 +363,8 @@ ${url.searchParams.get("newsecret") ? `<div class="newcode"><b>新 agent 密钥�
 </div></div>` : ""}
 <div style="margin:16px 0;padding:12px;border:1px dashed #999;border-radius:8px">
 <b>邀请码</b> <span style="color:#666">生成一次码发给 agent，申请时必填（1小时有效）</span><br>
-<form method="POST" action="${formBase}/invite" style="display:inline"><button>生成邀请码</button></form>
-${codeItems ? `<div style="margin-top:8px"><b>有效邀请码：</b>${codeItems}</div>` : `<div style="color:#999;margin-top:8px">暂无有效邀请码</div>`}
+<button data-action="invite">生成邀请码</button>
+${codeItems ? `<div style="margin-top:8px"><b>有效邀请码：</b>${codeItems}</div>` : `<div style="color:#999;margin-top:8px">暂无有效邀请码</div>`}<div id="invite-result" style="display:none;background:#e3f2fd;border:2px solid #2196f3;border-radius:6px;padding:10px;margin-top:8px"></div>
 </div>
 <div style="margin:16px 0;padding:12px;border:1px solid #999;border-radius:8px">
 <b>已接入 Agent</b> <span style="color:#666">换 Secret 后旧 secret 失效，需重新发给 agent；吊销后该邮箱所有 token 失效</span>
@@ -392,34 +382,34 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
     const revokePath = isAdminHost2 ? "/revoke" : "/admin/revoke";
     // 吊销：该邮箱所有 token 失效
     if (path === revokePath && request.method === "POST") {
-      await ensureOAuthTables(env);
-      const form = await request.formData();
-      const id = form.get("id") || "";
-      const req = await env.DB.prepare("SELECT email FROM provision_requests WHERE id=?").bind(id).first();
-      if (req && req.email) {
-        await env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=?").bind(req.email).run();
-        await env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email).run();
-      }
-      const back = isAdminHost2 ? url.origin + "/" : url.origin + "/admin";
-      return Response.redirect(back, 302);
+      try {
+        await ensureOAuthTables(env);
+        const body = await request.json();
+        const id = body.id || "";
+        const req = await env.DB.prepare("SELECT email FROM provision_requests WHERE id=?").bind(id).first();
+        if (req && req.email) {
+          await env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=?").bind(req.email).run();
+          await env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email).run();
+        }
+        return Response.json({ ok: true });
+      } catch (e) { return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 }); }
     }
     // 换 Secret：生成新的 ask_，旧的失效
     if (path === rotatePath && request.method === "POST") {
-      await ensureOAuthTables(env);
-      const form = await request.formData();
-      const id = form.get("id") || "";
-      const req = await env.DB.prepare("SELECT email FROM provision_requests WHERE id=? AND status='approved'").bind(id).first();
-      const back = isAdminHost2 ? url.origin + "/" : url.origin + "/admin";
-      if (!req || !req.email) return Response.redirect(back, 302);
-      const secret = "ask_" + [...crypto.getRandomValues(new Uint8Array(18))].map(b => b.toString(16).padStart(2, "0")).join("");
-      const secretHash = await sha256hex(secret);
-      // 吊销旧 token
-      await env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=?").bind(req.email).run();
-      await env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email).run();
-      // 写入新 secret
-      await env.DB.prepare("UPDATE provision_requests SET secret_hash=? WHERE id=?").bind(secretHash, id).run();
-      await env.DB.prepare("INSERT INTO agent_tokens (token_hash, email, request_id) VALUES (?,?,?)").bind(secretHash, req.email, id).run();
-      return Response.redirect(back + "?newsecret=" + encodeURIComponent(secret) + "&email=" + encodeURIComponent(req.email), 302);
+      try {
+        await ensureOAuthTables(env);
+        const body = await request.json();
+        const id = body.id || "";
+        const req = await env.DB.prepare("SELECT email FROM provision_requests WHERE id=? AND status='approved'").bind(id).first();
+        if (!req || !req.email) return Response.json({ ok: false, error: "not_found" }, { status: 404 });
+        const secret = "ask_" + [...crypto.getRandomValues(new Uint8Array(18))].map(b => b.toString(16).padStart(2, "0")).join("");
+        const secretHash = await sha256hex(secret);
+        await env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=?").bind(req.email).run();
+        await env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email).run();
+        await env.DB.prepare("UPDATE provision_requests SET secret_hash=? WHERE id=?").bind(secretHash, id).run();
+        await env.DB.prepare("INSERT INTO agent_tokens (token_hash, email, request_id) VALUES (?,?,?)").bind(secretHash, req.email, id).run();
+        return Response.json({ ok: true, email: req.email, secret });
+      } catch (e) { return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 }); }
     }
     // 生成邀请码（只显示一次）
     if (path === invitePath && request.method === "POST") {
@@ -427,22 +417,20 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       const code = "inv_" + [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, "0")).join("");
       const hash = await sha256hex(code);
       await env.DB.prepare("INSERT INTO invite_codes (code_hash, code) VALUES (?,?)").bind(hash, code).run();
-      const back = isAdminHost2 ? url.origin + "/" : url.origin + "/admin";
-      // 通过 query 参数一次性显示（简单版）
-      return Response.redirect(back + "?newcode=" + encodeURIComponent(code), 302);
+      return Response.json({ ok: true, code });
     }
     if ((path === approvePath || path === denyPath) && request.method === "POST") {
+      try {
       await ensureOAuthTables(env);
-      const form = await request.formData();
-      const id = form.get("id") || "";
+      const body = await request.json();
+      const id = body.id || "";
       const approve = path === approvePath;
-      const back = isAdminHost2 ? url.origin + "/" : url.origin + "/admin";
       if (!approve) {
         await env.DB.prepare("UPDATE provision_requests SET status='denied' WHERE id=?").bind(id).run();
-        return Response.redirect(back, 302);
+        return Response.json({ ok: true });
       }
       // 通过：手动邮箱 + 生成 secret + 建 mailbox 记录
-      const email = (form.get("email") || "").trim().toLowerCase();
+      const email = (body.email || "").trim().toLowerCase();
       if (!email || !email.endsWith("@abot.run")) {
         return Response.json({ error: "invalid_email", message: "邮箱必须是 xxx@abot.run" }, { status: 400 });
       }
@@ -462,8 +450,8 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       await env.DB.prepare(`CREATE TABLE IF NOT EXISTS mailboxes (
         email TEXT PRIMARY KEY, request_id TEXT, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
       await env.DB.prepare("INSERT OR IGNORE INTO mailboxes (email, request_id) VALUES (?,?)").bind(email, id).run();
-      // secret 只显示一次
-      return Response.redirect(back + "?newsecret=" + encodeURIComponent(secret) + "&email=" + encodeURIComponent(email), 302);
+      return Response.json({ ok: true, email, secret });
+      } catch (e) { return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 }); }
     }
 
     // ---- 以下为 MCP 代理（需鉴权） ----
@@ -485,6 +473,99 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
     }
     if (!authed) {
       return Response.json({ error: "unauthorized" }, { status: 401 });
+    }
+
+    // ---- 统一 MCP 网关：POST /mcp ----
+    if (path === "/mcp" && request.method === "POST") {
+      try {
+        const rpc = await request.json();
+        const method = rpc.method;
+        const rpcId = rpc.id;
+        
+        // MCP 服务注册表
+        const MCP_SERVICES = [
+          { prefix: "mail", route: ROUTES["/mail/"] },
+          { prefix: "data", route: ROUTES["/data/"] },
+          { prefix: "health", route: ROUTES["/health/"] },
+          { prefix: "rules", route: ROUTES["/rules/"] },
+          { prefix: "secrets", route: ROUTES["/secrets/"] },
+        ];
+        
+        async function callBackend(svc, rpcPayload) {
+          const token = env[svc.route.token_env];
+          const headers = {
+            "Content-Type": "application/json",
+            "X-Internal-Token": token,
+          };
+          if (agentEmail) headers["X-Abot-Owner-Email"] = agentEmail;
+          const resp = await fetch(svc.route.host + "/mcp", {
+            method: "POST",
+            headers,
+            body: JSON.stringify(rpcPayload),
+          });
+          return resp.json();
+        }
+        
+        if (method === "initialize") {
+          return Response.json({
+            jsonrpc: "2.0", id: rpcId,
+            result: {
+              protocolVersion: "2024-11-05",
+              capabilities: { tools: {} },
+              serverInfo: { name: "aBot", version: "1.0.0" },
+            },
+          });
+        }
+        
+        if (method === "notifications/initialized") {
+          return new Response(null, { status: 202 });
+        }
+        
+        if (method === "tools/list") {
+          const allTools = [];
+          for (const svc of MCP_SERVICES) {
+            try {
+              const r = await callBackend(svc, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
+              const tools = (r.result && r.result.tools) || [];
+              for (const t of tools) {
+                allTools.push({
+                  name: svc.prefix + "_" + t.name,
+                  description: "[" + svc.prefix + "] " + (t.description || ""),
+                  inputSchema: t.inputSchema,
+                });
+              }
+            } catch (e) {
+              // 单个服务失败不影响其他
+            }
+          }
+          return Response.json({ jsonrpc: "2.0", id: rpcId, result: { tools: allTools } });
+        }
+        
+        if (method === "tools/call") {
+          const fullName = (rpc.params && rpc.params.name) || "";
+          const args = (rpc.params && rpc.params.arguments) || {};
+          const idx = fullName.indexOf("_");
+          if (idx < 0) {
+            return Response.json({ jsonrpc: "2.0", id: rpcId, error: { code: -32602, message: "unknown tool: " + fullName } });
+          }
+          const prefix = fullName.slice(0, idx);
+          const realName = fullName.slice(idx + 1);
+          const svc = MCP_SERVICES.find(function(s) { return s.prefix === prefix; });
+          if (!svc) {
+            return Response.json({ jsonrpc: "2.0", id: rpcId, error: { code: -32602, message: "unknown service: " + prefix } });
+          }
+          const r = await callBackend(svc, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: realName, arguments: args } });
+          // 透传后端的 result/error
+          if (r.error) {
+            return Response.json({ jsonrpc: "2.0", id: rpcId, error: r.error });
+          }
+          return Response.json({ jsonrpc: "2.0", id: rpcId, result: r.result });
+        }
+        
+        return Response.json({ jsonrpc: "2.0", id: rpcId, error: { code: -32601, message: "method not found: " + method } });
+      } catch (e) {
+        return Response.json({ jsonrpc: "2.0", error: { code: -32603, message: String(e.message || e) } }, { status: 500 });
+      }
     }
 
     // 路由匹配
@@ -557,3 +638,4 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
     });
   },
 };
+
