@@ -44,7 +44,7 @@ async function ensureOAuthTables(env) {
     status TEXT DEFAULT 'pending', email TEXT, secret_hash TEXT,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS invite_codes (
-    code_hash TEXT PRIMARY KEY, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    code_hash TEXT PRIMARY KEY, code TEXT, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     used_at TEXT, used_by TEXT)`).run();
 }
 
@@ -211,12 +211,17 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
         return Response.json({ error: "invite_code_required", message: "需要邀请码才能申请" }, { status: 400 });
       }
       const codeHash = await sha256hex(inviteCode);
-      const codeRow = await env.DB.prepare("SELECT code_hash, used_at FROM invite_codes WHERE code_hash=?").bind(codeHash).first();
+      const codeRow = await env.DB.prepare("SELECT code_hash, used_at, created_at FROM invite_codes WHERE code_hash=?").bind(codeHash).first();
       if (!codeRow) {
         return Response.json({ error: "invalid_invite_code" }, { status: 403 });
       }
       if (codeRow.used_at) {
         return Response.json({ error: "invite_code_used" }, { status: 403 });
+      }
+      // 1小时有效期
+      const createdMs = new Date(codeRow.created_at).getTime();
+      if (Date.now() - createdMs > 3600 * 1000) {
+        return Response.json({ error: "invite_code_expired", message: "邀请码已过期（1小时有效）" }, { status: 403 });
       }
       // 简单限流：最近1小时最多10个申请
       const recent = await env.DB.prepare(
@@ -253,6 +258,17 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       const rows = await env.DB.prepare(
         "SELECT id, agent_name, reason, status, email, created_at FROM provision_requests ORDER BY created_at DESC LIMIT 50"
       ).all();
+      // 有效邀请码（未使用、1小时内）
+      const codes = await env.DB.prepare(
+        "SELECT code, created_at FROM invite_codes WHERE used_at IS NULL AND created_at > datetime('now','-1 hour') ORDER BY created_at DESC"
+      ).all();
+      const codeItems = (codes.results || []).map((c, i) =>
+        `<div style="display:flex;align-items:center;gap:8px;margin:4px 0">
+          <code id="vc${i}" style="flex:1">${c.code}</code>
+          <button onclick="navigator.clipboard.writeText(document.getElementById('vc${i}').innerText).then(()=>{this.innerText='已复制✓';setTimeout(()=>this.innerText='复制',1500)})" style="padding:4px 12px;font-size:12px">复制</button>
+          <span style="color:#999;font-size:12px">${c.created_at}</span>
+        </div>`
+      ).join("");
       const formBase = (url.hostname === "admin.abot.run") ? "" : "/admin";
       const items = (rows.results || []).map((r) =>
         `<div style="border:1px solid #ddd;border-radius:8px;padding:12px;margin:8px 0">
@@ -289,8 +305,9 @@ ${url.searchParams.get("newsecret") ? `<div class="newcode"><b>新 agent 密钥�
 <button onclick="navigator.clipboard.writeText(document.getElementById('agentSecret').innerText).then(()=>{this.innerText='已复制✓';setTimeout(()=>this.innerText='复制',1500)})" style="padding:6px 14px;font-size:13px">复制</button>
 </div></div>` : ""}
 <div style="margin:16px 0;padding:12px;border:1px dashed #999;border-radius:8px">
-<b>邀请码</b> <span style="color:#666">生成一次码发给 agent，申请时必填</span><br>
+<b>邀请码</b> <span style="color:#666">生成一次码发给 agent，申请时必填（1小时有效）</span><br>
 <form method="POST" action="${formBase}/invite" style="display:inline"><button>生成邀请码</button></form>
+${codeItems ? `<div style="margin-top:8px"><b>有效邀请码：</b>${codeItems}</div>` : `<div style="color:#999;margin-top:8px">暂无有效邀请码</div>`}
 </div>
 ${items || "<p>暂无申请</p>"}</body></html>`,
         { headers: { "Content-Type": "text/html;charset=utf-8" } });
@@ -305,7 +322,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       await ensureOAuthTables(env);
       const code = "inv_" + [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, "0")).join("");
       const hash = await sha256hex(code);
-      await env.DB.prepare("INSERT INTO invite_codes (code_hash) VALUES (?)").bind(hash).run();
+      await env.DB.prepare("INSERT INTO invite_codes (code_hash, code) VALUES (?,?)").bind(hash, code).run();
       const back = isAdminHost2 ? url.origin + "/" : url.origin + "/admin";
       // 通过 query 参数一次性显示（简单版）
       return Response.redirect(back + "?newcode=" + encodeURIComponent(code), 302);
