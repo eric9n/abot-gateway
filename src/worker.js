@@ -31,15 +31,15 @@ function newId(prefix) {
 }
 
 async function ensureOAuthTables(env) {
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS oauth_clients (
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS gw_oauth_clients (
     client_id TEXT PRIMARY KEY, redirect_uris TEXT NOT NULL,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS oauth_codes (
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS gw_oauth_codes (
     code TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
     code_challenge TEXT, expires_at INTEGER NOT NULL)`).run();
-  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS oauth_tokens (
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS gw_oauth_tokens (
     token TEXT PRIMARY KEY, email TEXT, created_at INTEGER NOT NULL)`).run();
-  try { await env.DB.prepare("ALTER TABLE oauth_tokens ADD COLUMN email TEXT").run(); } catch {}
+  try { await env.DB.prepare("ALTER TABLE gw_oauth_tokens ADD COLUMN email TEXT").run(); } catch {}
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS provision_requests (
     id TEXT PRIMARY KEY, agent_name TEXT, reason TEXT, requested_email TEXT,
     status TEXT DEFAULT 'pending', email TEXT, secret_hash TEXT,
@@ -115,7 +115,7 @@ export default {
         return Response.json({ error: "invalid_redirect_uri" }, { status: 400 });
       }
       const clientId = newId("cli");
-      await env.DB.prepare("INSERT INTO oauth_clients (client_id, redirect_uris) VALUES (?,?)")
+      await env.DB.prepare("INSERT INTO gw_oauth_clients (client_id, redirect_uris) VALUES (?,?)")
         .bind(clientId, JSON.stringify(redirectUris)).run();
       return Response.json({ client_id: clientId, redirect_uris: redirectUris });
     }
@@ -130,7 +130,7 @@ export default {
       const codeChallenge = q.get("code_challenge") || "";
 
       // 验证 client
-      const client = await env.DB.prepare("SELECT * FROM oauth_clients WHERE client_id=?")
+      const client = await env.DB.prepare("SELECT * FROM gw_oauth_clients WHERE client_id=?")
         .bind(clientId).first();
       if (!client) {
         return new Response("invalid client_id", { status: 400 });
@@ -162,7 +162,7 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
         const code = newId("code");
         const expiresAt = Date.now() + 10 * 60 * 1000; // 10 分钟
         await env.DB.prepare(
-          "INSERT INTO oauth_codes (code, client_id, redirect_uri, code_challenge, expires_at) VALUES (?,?,?,?,?)"
+          "INSERT INTO gw_oauth_codes (code, client_id, redirect_uri, code_challenge, expires_at) VALUES (?,?,?,?,?)"
         ).bind(code, clientId, redirectUri, codeChallenge || null, expiresAt).run();
         const dest = new URL(redirectUri);
         dest.searchParams.set("code", code);
@@ -191,7 +191,7 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
           return Response.json({ error: "invalid_grant", message: "邮箱或 secret 不正确" }, { status: 401 });
         }
         const token = "abot_" + [...crypto.getRandomValues(new Uint8Array(18))].map(b => b.toString(16).padStart(2, "0")).join("");
-        await env.DB.prepare("INSERT INTO oauth_tokens (token, email, created_at) VALUES (?,?,?)")
+        await env.DB.prepare("INSERT INTO gw_oauth_tokens (token, email, created_at) VALUES (?,?,?)")
           .bind(token, row.email, Date.now()).run();
         return Response.json({ access_token: token, token_type: "Bearer", email: row.email });
       }
@@ -202,7 +202,7 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       const redirectUri = form.get("redirect_uri") || "";
       const verifier = form.get("code_verifier") || "";
 
-      const row = await env.DB.prepare("SELECT * FROM oauth_codes WHERE code=?").bind(code).first();
+      const row = await env.DB.prepare("SELECT * FROM gw_oauth_codes WHERE code=?").bind(code).first();
       if (!row || row.expires_at < Date.now() || row.redirect_uri !== redirectUri) {
         return Response.json({ error: "invalid_grant" }, { status: 400 });
       }
@@ -218,10 +218,10 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
         }
       }
       // 删除已用的 code
-      await env.DB.prepare("DELETE FROM oauth_codes WHERE code=?").bind(code).run();
+      await env.DB.prepare("DELETE FROM gw_oauth_codes WHERE code=?").bind(code).run();
       // 发 token
       const token = "abot_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
-      await env.DB.prepare("INSERT INTO oauth_tokens (token, created_at) VALUES (?,?)")
+      await env.DB.prepare("INSERT INTO gw_oauth_tokens (token, created_at) VALUES (?,?)")
         .bind(token, Date.now()).run();
       return Response.json({ access_token: token, token_type: "Bearer", expires_in: 31536000 });
     }
@@ -398,7 +398,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       const req = await env.DB.prepare("SELECT email FROM provision_requests WHERE id=?").bind(id).first();
       if (req && req.email) {
         await env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=?").bind(req.email).run();
-        await env.DB.prepare("DELETE FROM oauth_tokens WHERE email=?").bind(req.email).run();
+        await env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email).run();
       }
       const back = isAdminHost2 ? url.origin + "/" : url.origin + "/admin";
       return Response.redirect(back, 302);
@@ -415,7 +415,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       const secretHash = await sha256hex(secret);
       // 吊销旧 token
       await env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=?").bind(req.email).run();
-      await env.DB.prepare("DELETE FROM oauth_tokens WHERE email=?").bind(req.email).run();
+      await env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email).run();
       // 写入新 secret
       await env.DB.prepare("UPDATE provision_requests SET secret_hash=? WHERE id=?").bind(secretHash, id).run();
       await env.DB.prepare("INSERT INTO agent_tokens (token_hash, email, request_id) VALUES (?,?,?)").bind(secretHash, req.email, id).run();
@@ -477,7 +477,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       authed = true;
     } else if (token.startsWith("abot_")) {
       await ensureOAuthTables(env);
-      const row = await env.DB.prepare("SELECT email FROM oauth_tokens WHERE token=?").bind(token).first();
+      const row = await env.DB.prepare("SELECT email FROM gw_oauth_tokens WHERE token=?").bind(token).first();
       if (row) {
         authed = true;
         agentEmail = row.email || null;
