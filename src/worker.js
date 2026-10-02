@@ -232,22 +232,26 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
     }
 
     // 管理页（Cloudflare Access 保护，代码内不鉴权）
-    if (path === "/admin" && request.method === "GET") {
+    // 管理页：admin.abot.run/ 或 abot.run/admin（Cloudflare Access 保护）
+    const host = url.hostname;
+    const isAdmin = host === "admin.abot.run" ? (path === "/" || path === "") : (path === "/admin");
+    if (isAdmin && request.method === "GET") {
       await ensureOAuthTables(env);
       const rows = await env.DB.prepare(
         "SELECT id, agent_name, reason, status, created_at FROM provision_requests ORDER BY created_at DESC LIMIT 50"
       ).all();
+      const formBase = (url.hostname === "admin.abot.run") ? "" : "/admin";
       const items = (rows.results || []).map((r) =>
         `<div style="border:1px solid #ddd;border-radius:8px;padding:12px;margin:8px 0">
           <b>${r.agent_name || "(未命名)"}</b> <span style="color:#666">${r.id}</span><br>
           <span>${r.reason || ""}</span><br>
           <span>状态: ${r.status}</span> <span style="color:#999">${r.created_at}</span><br>
           ${r.status === "pending" ? `
-            <form method="POST" action="/admin/approve" style="display:inline">
+            <form method="POST" action="${formBase}/approve" style="display:inline">
               <input type="hidden" name="id" value="${r.id}">
               <button>通过</button>
             </form>
-            <form method="POST" action="/admin/deny" style="display:inline">
+            <form method="POST" action="${formBase}/deny" style="display:inline">
               <input type="hidden" name="id" value="${r.id}">
               <button>拒绝</button>
             </form>` : ""}
@@ -260,16 +264,20 @@ button{padding:8px 20px;margin:4px;font-size:14px;cursor:pointer}</style>
         { headers: { "Content-Type": "text/html;charset=utf-8" } });
     }
 
-    if ((path === "/admin/approve" || path === "/admin/deny") && request.method === "POST") {
+    const isAdminHost2 = url.hostname === "admin.abot.run";
+    const approvePath = isAdminHost2 ? "/approve" : "/admin/approve";
+    const denyPath = isAdminHost2 ? "/deny" : "/admin/deny";
+    if ((path === approvePath || path === denyPath) && request.method === "POST") {
       await ensureOAuthTables(env);
       const form = await request.formData();
       const id = form.get("id") || "";
-      const approve = path === "/admin/approve";
+      const approve = path === approvePath;
       // 通过时分配邮箱
       const email = approve ? `agent_${id.slice(5, 13)}@abot.run` : null;
       await env.DB.prepare("UPDATE provision_requests SET status=?, email=? WHERE id=?")
         .bind(approve ? "approved" : "denied", email, id).run();
-      return Response.redirect(url.origin + "/admin", 302);
+      const back = isAdminHost2 ? url.origin + "/" : url.origin + "/admin";
+      return Response.redirect(back, 302);
     }
 
     // ---- 以下为 MCP 代理（需鉴权） ----
