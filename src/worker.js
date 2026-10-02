@@ -7,10 +7,25 @@ const ROUTES = {
 };
 
 function newId(prefix) {
-  return prefix + "_" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+  const r = [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(36)).join("").replace(/[^a-z0-9]/g, "");
+  return prefix + "_" + r.slice(0, 12) + Date.now().toString(36);
 }
 
+// HTML 转义（防 XSS）
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+
+// 通用 500（不泄漏内部细节）
+function internalError() {
+  return Response.json({ ok: false, error: "internal_error" }, { status: 500 });
+}
+
+let schemaReady = false;
 async function ensureOAuthTables(env) {
+  if (schemaReady) return;
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS gw_oauth_clients (
     client_id TEXT PRIMARY KEY, redirect_uris TEXT NOT NULL,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
@@ -36,11 +51,68 @@ async function ensureOAuthTables(env) {
     revoked_at TEXT)`).run();
   // 老表补列
   try { await env.DB.prepare("ALTER TABLE invite_codes ADD COLUMN code TEXT").run(); } catch {}
+  // 懒清理：过期 code / token
+  try { await env.DB.prepare("DELETE FROM gw_oauth_codes WHERE expires_at < ?").bind(Date.now()).run(); } catch {}
+  try { await env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE created_at < ?").bind(Date.now() - 365 * 24 * 3600 * 1000).run(); } catch {}
+  schemaReady = true;
 }
 
 async function sha256hex(s) {
   const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s));
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ---- Cloudflare Access JWT 校验（admin 纵深防御） ----
+const ACCESS_TEAM = "boliam.cloudflareaccess.com";
+const ACCESS_AUD = "05d351ef-e796-4e3e-a6f4-bbcc30b98941";
+let jwksCache = null;
+let jwksCacheAt = 0;
+
+function b64urlToBytes(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function getAccessJwks() {
+  if (jwksCache && Date.now() - jwksCacheAt < 10 * 60 * 1000) return jwksCache;
+  const r = await fetch("https://" + ACCESS_TEAM + "/cdn-cgi/access/certs");
+  if (!r.ok) throw new Error("jwks fetch failed");
+  jwksCache = await r.json();
+  jwksCacheAt = Date.now();
+  return jwksCache;
+}
+
+// 返回 null 表示通过，否则返回 403 Response
+async function requireAccess(request) {
+  const jwt = request.headers.get("Cf-Access-Jwt-Assertion") || "";
+  if (!jwt) {
+    return new Response("forbidden: Cloudflare Access required", { status: 403 });
+  }
+  try {
+    const parts = jwt.split(".");
+    if (parts.length !== 3) throw new Error("bad jwt");
+    const header = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[0])));
+    const payload = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[1])));
+    if (payload.exp * 1000 < Date.now()) throw new Error("expired");
+    const aud = payload.aud;
+    const audOk = Array.isArray(aud) ? aud.includes(ACCESS_AUD) : aud === ACCESS_AUD;
+    if (!audOk) throw new Error("bad aud");
+    const jwks = await getAccessJwks();
+    const jwk = (jwks.keys || []).find((k) => k.kid === header.kid);
+    if (!jwk) throw new Error("unknown kid");
+    const key = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+    const data = new TextEncoder().encode(parts[0] + "." + parts[1]);
+    const sig = b64urlToBytes(parts[2]);
+    const ok = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, sig, data);
+    if (!ok) throw new Error("bad signature");
+    return null;
+  } catch (e) {
+    return new Response("forbidden: invalid Access token", { status: 403 });
+  }
 }
 
 export default {
@@ -51,16 +123,6 @@ export default {
     // 健康检查（免认证）
     if (path === "/health" && request.method === "GET") {
       return Response.json({ ok: true, service: "abot-gateway" });
-    }
-
-    // 调试：D1 连接测试
-    if (path === "/debug/db" && request.method === "GET") {
-      try {
-        const r = await env.DB.prepare("SELECT 1 as one").first();
-        return Response.json({ ok: true, db: !!r });
-      } catch (e) {
-        return Response.json({ ok: false, error: String(e && e.message || e) });
-      }
     }
 
     // OAuth 元数据
@@ -78,12 +140,22 @@ export default {
       });
     }
 
+    // MCP 受保护资源元数据（RFC 9728，供 MCP 客户端发现鉴权配置）
+    if (path === "/.well-known/oauth-protected-resource") {
+      return Response.json({
+        resource: url.origin + "/mcp",
+        authorization_servers: [url.origin],
+        bearer_methods_supported: ["header"],
+        resource_name: "aBot Gateway",
+      });
+    }
+
     // DCR：动态客户端注册
     if (path === "/oauth/register" && request.method === "POST") {
       try {
         await ensureOAuthTables(env);
       } catch (e) {
-        return Response.json({ error: "db_error", detail: String(e && e.message || e) }, { status: 500 });
+        return Response.json({ error: "db_error" }, { status: 500 });
       }
       let body;
       try {
@@ -92,8 +164,22 @@ export default {
         return Response.json({ error: "invalid_request", detail: "body must be JSON" }, { status: 400 });
       }
       const redirectUris = body.redirect_uris || [];
-      if (!Array.isArray(redirectUris) || redirectUris.length === 0) {
+      if (!Array.isArray(redirectUris) || redirectUris.length === 0 || redirectUris.length > 10) {
         return Response.json({ error: "invalid_redirect_uri" }, { status: 400 });
+      }
+      for (const u of redirectUris) {
+        if (typeof u !== "string" || u.length > 2000) {
+          return Response.json({ error: "invalid_redirect_uri" }, { status: 400 });
+        }
+        let parsed;
+        try { parsed = new URL(u); } catch {
+          return Response.json({ error: "invalid_redirect_uri" }, { status: 400 });
+        }
+        const isHttps = parsed.protocol === "https:";
+        const isLocalhost = parsed.protocol === "http:" && (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1");
+        if (!isHttps && !isLocalhost) {
+          return Response.json({ error: "invalid_redirect_uri", detail: "redirect_uri must be https (or http://localhost)" }, { status: 400 });
+        }
       }
       const clientId = newId("cli");
       await env.DB.prepare("INSERT INTO gw_oauth_clients (client_id, redirect_uris) VALUES (?,?)")
@@ -129,13 +215,13 @@ input{display:block;width:100%;padding:10px;margin:8px 0;font-size:15px;border:1
 button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;border-radius:8px;cursor:pointer;margin-top:12px}</style>
 </head><body>
 <h2>aBot 网关授权</h2>
-<p>客户端 <code>${clientId}</code> 请求访问你的 aBot 服务。</p>
+<p>客户端 <code>${esc(clientId)}</code> 请求访问你的 aBot 服务。</p>
 <p style="color:#666">请输入你的 agent 邮箱和 Secret（在 admin 页获取）。</p>
 <form method="POST">
-<input type="hidden" name="client_id" value="${clientId}">
-<input type="hidden" name="redirect_uri" value="${redirectUri}">
-<input type="hidden" name="state" value="${state}">
-<input type="hidden" name="code_challenge" value="${codeChallenge}">
+<input type="hidden" name="client_id" value="${esc(clientId)}">
+<input type="hidden" name="redirect_uri" value="${esc(redirectUri)}">
+<input type="hidden" name="state" value="${esc(state)}">
+<input type="hidden" name="code_challenge" value="${esc(codeChallenge)}">
 <input type="email" name="email" placeholder="agent@abot.run" required>
 <input type="password" name="secret" placeholder="ask_..." required>
 <button type="submit">登录并授权</button>
@@ -144,6 +230,17 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
 
       if (request.method === "POST") {
         const form = await request.formData();
+        // 参数以 form 为准（query 兜底），重新校验防篡改
+        const fClientId = (form.get("client_id") || clientId).toString();
+        const fRedirectUri = (form.get("redirect_uri") || redirectUri).toString();
+        const fState = (form.get("state") || state).toString();
+        const fCodeChallenge = (form.get("code_challenge") || codeChallenge).toString();
+        const fClient = await env.DB.prepare("SELECT * FROM gw_oauth_clients WHERE client_id=?")
+          .bind(fClientId).first();
+        const fAllowed = fClient ? JSON.parse(fClient.redirect_uris || "[]") : [];
+        if (!fClient || !fAllowed.includes(fRedirectUri)) {
+          return new Response("invalid client_id or redirect_uri", { status: 400 });
+        }
         // 验证邮箱+secret
         const email = (form.get("email") || "").trim().toLowerCase();
         const secret = (form.get("secret") || "").trim();
@@ -162,10 +259,10 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
         const expiresAt = Date.now() + 10 * 60 * 1000;
         await env.DB.prepare(
           "INSERT INTO gw_oauth_codes (code, client_id, redirect_uri, code_challenge, expires_at, email) VALUES (?,?,?,?,?,?)"
-        ).bind(code, clientId, redirectUri, codeChallenge || null, expiresAt, email).run();
-        const dest = new URL(redirectUri);
+        ).bind(code, fClientId, fRedirectUri, fCodeChallenge || null, expiresAt, email).run();
+        const dest = new URL(fRedirectUri);
         dest.searchParams.set("code", code);
-        if (state) dest.searchParams.set("state", state);
+        if (fState) dest.searchParams.set("state", fState);
         return Response.redirect(dest.toString(), 302);
       }
     }
@@ -219,7 +316,7 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       // 删除已用的 code
       await env.DB.prepare("DELETE FROM gw_oauth_codes WHERE code=?").bind(code).run();
       // 发 token（绑定邮箱）
-      const token = "abot_" + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+      const token = "abot_" + [...crypto.getRandomValues(new Uint8Array(24))].map(b => b.toString(16).padStart(2, "0")).join("");
       await env.DB.prepare("INSERT INTO gw_oauth_tokens (token, email, created_at) VALUES (?,?,?)")
         .bind(token, row.email || null, Date.now()).run();
       return Response.json({ access_token: token, token_type: "Bearer", expires_in: 31536000 });
@@ -302,6 +399,8 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
     const host = url.hostname;
     const isAdmin = host === "admin.abot.run" ? (path === "/" || path === "") : (path === "/admin");
     if (isAdmin && request.method === "GET") {
+      const denied = await requireAccess(request);
+      if (denied) return denied;
       await ensureOAuthTables(env);
       const rows = await env.DB.prepare(
         "SELECT id, agent_name, reason, requested_email, status, email, created_at FROM provision_requests ORDER BY created_at DESC LIMIT 50"
@@ -312,32 +411,31 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       ).all();
       const codeItems = (codes.results || []).map((c, i) =>
         `<div style="display:flex;align-items:center;gap:8px;margin:4px 0">
-          <code id="vc${i}" style="flex:1">${c.code}</code>
+          <code id="vc${i}" style="flex:1">${esc(c.code)}</code>
           <button onclick="navigator.clipboard.writeText(document.getElementById('vc${i}').innerText).then(()=>{this.innerText='已复制✓';setTimeout(()=>this.innerText='复制',1500)})" style="padding:4px 12px;font-size:12px">复制</button>
-          <span style="color:#999;font-size:12px">${c.created_at}</span>
+          <span style="color:#999;font-size:12px">${esc(c.created_at)}</span>
         </div>`
       ).join("");
-      const formBase = (url.hostname === "admin.abot.run") ? "" : "/admin";
       // 已批准的 agent 列表
       const agents = await env.DB.prepare(
         "SELECT id, agent_name, email, created_at FROM provision_requests WHERE status='approved' AND email IS NOT NULL ORDER BY created_at DESC"
       ).all();
       const agentItems = (agents.results || []).map((a, i) =>
         `<div class="agent-row" style="display:flex;align-items:center;gap:8px;margin:6px 0;padding:8px;border:1px solid #ddd;border-radius:6px">
-          <div style="flex:1"><b>${a.agent_name || "(未命名)"}</b><br><code>${a.email}</code></div>
+          <div style="flex:1"><b>${esc(a.agent_name) || "(未命名)"}</b><br><code>${esc(a.email)}</code></div>
           <button data-action="rotate" data-id="${a.id}" style="padding:4px 12px;font-size:12px">换 Secret</button>
           <button data-action="revoke" data-id="${a.id}" style="padding:4px 12px;font-size:12px;background:#ffebee">吊销</button>
         </div>`
       ).join("");
       const items = (rows.results || []).map((r) =>
         `<div style="border:1px solid #ddd;border-radius:8px;padding:12px;margin:8px 0">
-          <b>${r.agent_name || "(未命名)"}</b> <span style="color:#666">${r.id}</span><br>
-          <span>${r.reason || ""}</span><br>
-          <span>状态: ${r.status}</span> <span style="color:#999">${r.created_at}</span><br>
-          ${r.status === "approved" && r.email ? `<span style="color:#2e7d32">邮箱: ${r.email}</span><br>` : ""}
+          <b>${esc(r.agent_name) || "(未命名)"}</b> <span style="color:#666">${esc(r.id)}</span><br>
+          <span>${esc(r.reason)}</span><br>
+          <span>状态: ${esc(r.status)}</span> <span style="color:#999">${esc(r.created_at)}</span><br>
+          ${r.status === "approved" && r.email ? `<span style="color:#2e7d32">邮箱: ${esc(r.email)}</span><br>` : ""}
           ${r.status === "pending" ? `
             <div class="req-row" style="margin-top:8px">
-              ${r.requested_email ? `<span style="color:#666">申请想要：${r.requested_email}</span><br>` : ""}
+              ${r.requested_email ? `<span style="color:#666">申请想要：${esc(r.requested_email)}</span><br>` : ""}
               <button data-action="approve" data-id="${r.id}">通过并建邮箱</button>
               <button data-action="deny" data-id="${r.id}">拒绝</button>
             </div>` : ""}
@@ -350,17 +448,6 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
 button{padding:8px 20px;margin:4px;font-size:14px;cursor:pointer}
 .newcode{background:#e8f5e9;border:1px solid #4caf50;border-radius:8px;padding:12px;margin:12px 0;word-break:break-all}</style>
 </head><body><h2>aBot 新 Agent 审核</h2>
-${url.searchParams.get("newcode") ? `<div class="newcode"><b>新邀请码（只显示一次）：</b><br>
-<div style="display:flex;align-items:center;gap:8px;margin-top:8px">
-<code id="inviteCode" style="flex:1;font-size:15px">${url.searchParams.get("newcode")}</code>
-<button onclick="navigator.clipboard.writeText(document.getElementById('inviteCode').innerText).then(()=>{this.innerText='已复制✓';setTimeout(()=>this.innerText='复制',1500)})" style="padding:6px 14px;font-size:13px">复制</button>
-</div></div>` : ""}
-${url.searchParams.get("newsecret") ? `<div class="newcode"><b>新 agent 密钥（只显示一次，请复制发给 agent）：</b><br>
-<div style="margin-top:8px">邮箱: <code>${url.searchParams.get("email")}</code></div>
-<div style="display:flex;align-items:center;gap:8px;margin-top:8px">
-<code id="agentSecret" style="flex:1;font-size:14px">${url.searchParams.get("newsecret")}</code>
-<button onclick="navigator.clipboard.writeText(document.getElementById('agentSecret').innerText).then(()=>{this.innerText='已复制✓';setTimeout(()=>this.innerText='复制',1500)})" style="padding:6px 14px;font-size:13px">复制</button>
-</div></div>` : ""}
 <div style="margin:16px 0;padding:12px;border:1px dashed #999;border-radius:8px">
 <b>邀请码</b> <span style="color:#666">生成一次码发给 agent，申请时必填（1小时有效）</span><br>
 <button data-action="invite">生成邀请码</button>
@@ -382,6 +469,8 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
     const revokePath = isAdminHost2 ? "/revoke" : "/admin/revoke";
     // 吊销：该邮箱所有 token 失效
     if (path === revokePath && request.method === "POST") {
+      const denied = await requireAccess(request);
+        if (denied) return denied;
       try {
         await ensureOAuthTables(env);
         const body = await request.json();
@@ -392,10 +481,12 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
           await env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email).run();
         }
         return Response.json({ ok: true });
-      } catch (e) { return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 }); }
+      } catch (e) { return internalError(); }
     }
     // 换 Secret：生成新的 ask_，旧的失效
     if (path === rotatePath && request.method === "POST") {
+      const denied = await requireAccess(request);
+        if (denied) return denied;
       try {
         await ensureOAuthTables(env);
         const body = await request.json();
@@ -409,17 +500,23 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
         await env.DB.prepare("UPDATE provision_requests SET secret_hash=? WHERE id=?").bind(secretHash, id).run();
         await env.DB.prepare("INSERT INTO agent_tokens (token_hash, email, request_id) VALUES (?,?,?)").bind(secretHash, req.email, id).run();
         return Response.json({ ok: true, email: req.email, secret });
-      } catch (e) { return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 }); }
+      } catch (e) { return internalError(); }
     }
     // 生成邀请码（只显示一次）
     if (path === invitePath && request.method === "POST") {
-      await ensureOAuthTables(env);
-      const code = "inv_" + [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, "0")).join("");
-      const hash = await sha256hex(code);
-      await env.DB.prepare("INSERT INTO invite_codes (code_hash, code) VALUES (?,?)").bind(hash, code).run();
-      return Response.json({ ok: true, code });
+      try {
+        const denied = await requireAccess(request);
+        if (denied) return denied;
+        await ensureOAuthTables(env);
+        const code = "inv_" + [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, "0")).join("");
+        const hash = await sha256hex(code);
+        await env.DB.prepare("INSERT INTO invite_codes (code_hash, code) VALUES (?,?)").bind(hash, code).run();
+        return Response.json({ ok: true, code });
+      } catch (e) { return internalError(); }
     }
     if ((path === approvePath || path === denyPath) && request.method === "POST") {
+      const denied = await requireAccess(request);
+        if (denied) return denied;
       try {
       await ensureOAuthTables(env);
       const body = await request.json();
@@ -451,24 +548,30 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
         email TEXT PRIMARY KEY, request_id TEXT, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
       await env.DB.prepare("INSERT OR IGNORE INTO mailboxes (email, request_id) VALUES (?,?)").bind(email, id).run();
       return Response.json({ ok: true, email, secret });
-      } catch (e) { return Response.json({ ok: false, error: String(e.message || e) }, { status: 500 }); }
+      } catch (e) { return internalError(); }
     }
 
     // ---- 以下为 MCP 代理（需鉴权） ----
 
-    // 对外鉴权：GATEWAY_TOKEN / OAuth token(abot_)
+    // 对外鉴权：OAuth token(abot_)，必须绑定邮箱
     const auth = request.headers.get("Authorization") || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     let agentEmail = null;
     if (token.startsWith("abot_")) {
       await ensureOAuthTables(env);
-      const row = await env.DB.prepare("SELECT email FROM gw_oauth_tokens WHERE token=?").bind(token).first();
-      if (row && row.email) {
+      const row = await env.DB.prepare("SELECT email, created_at FROM gw_oauth_tokens WHERE token=?").bind(token).first();
+      if (row && row.email && row.created_at > Date.now() - 365 * 24 * 3600 * 1000) {
         agentEmail = row.email;
       }
     }
     if (!agentEmail) {
-      return Response.json({ error: "unauthorized" }, { status: 401 });
+      return new Response(JSON.stringify({ error: "unauthorized" }), {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+          "WWW-Authenticate": 'Bearer resource_metadata="https://abot.run/.well-known/oauth-protected-resource", error="invalid_token"',
+        },
+      });
     }
 
     // ---- 统一 MCP 网关：POST /mcp ----
@@ -490,8 +593,9 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
           { prefix: "secrets", route: ROUTES["/secrets/"] },
         ];
         
-        async function callBackend(svc, rpcPayload) {
+        async function callBackend(svc, rpcPayload, timeoutMs) {
           const token = env[svc.route.token_env];
+          if (!token) throw new Error("internal auth not configured");
           const headers = {
             "Content-Type": "application/json",
             "X-Internal-Token": token,
@@ -501,7 +605,9 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
             method: "POST",
             headers,
             body: JSON.stringify(rpcPayload),
+            signal: AbortSignal.timeout(timeoutMs || 15000),
           });
+          if (!resp.ok) throw new Error("backend error: " + resp.status);
           return resp.json();
         }
         
@@ -521,20 +627,22 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
         }
         
         if (method === "tools/list") {
+          // 并行拉取，单个失败不影响其他（12s 超时）
+          const settled = await Promise.allSettled(
+            MCP_SERVICES.map((svc) =>
+              callBackend(svc, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }, 12000)
+                .then((r) => ({ svc, tools: (r.result && r.result.tools) || [] }))
+            )
+          );
           const allTools = [];
-          for (const svc of MCP_SERVICES) {
-            try {
-              const r = await callBackend(svc, { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} });
-              const tools = (r.result && r.result.tools) || [];
-              for (const t of tools) {
-                allTools.push({
-                  name: svc.prefix + "_" + t.name,
-                  description: "[" + svc.prefix + "] " + (t.description || ""),
-                  inputSchema: t.inputSchema,
-                });
-              }
-            } catch (e) {
-              // 单个服务失败不影响其他
+          for (const s of settled) {
+            if (s.status !== "fulfilled") continue;
+            for (const t of s.value.tools) {
+              allTools.push({
+                name: s.value.svc.prefix + "_" + t.name,
+                description: "[" + s.value.svc.prefix + "] " + (t.description || ""),
+                inputSchema: t.inputSchema,
+              });
             }
           }
           return Response.json({ jsonrpc: "2.0", id: rpcId, result: { tools: allTools } });
@@ -553,7 +661,12 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
           if (!svc) {
             return Response.json({ jsonrpc: "2.0", id: rpcId, error: { code: -32602, message: "unknown service: " + prefix } });
           }
-          const r = await callBackend(svc, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: realName, arguments: args } });
+          let r;
+          try {
+            r = await callBackend(svc, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: realName, arguments: args } }, 30000);
+          } catch (e) {
+            return Response.json({ jsonrpc: "2.0", id: rpcId, error: { code: -32603, message: "backend unavailable: " + prefix } });
+          }
           // 透传后端的 result/error
           if (r.error) {
             return Response.json({ jsonrpc: "2.0", id: rpcId, error: r.error });
@@ -563,7 +676,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
         
         return Response.json({ jsonrpc: "2.0", id: rpcId, error: { code: -32601, message: "method not found: " + method } });
       } catch (e) {
-        return Response.json({ jsonrpc: "2.0", error: { code: -32603, message: String(e.message || e) } }, { status: 500 });
+        return Response.json({ jsonrpc: "2.0", id: (typeof rpcId !== "undefined" ? rpcId : null), error: { code: -32603, message: "internal error" } }, { status: 500 });
       }
     }
 
