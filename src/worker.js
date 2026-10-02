@@ -56,6 +56,16 @@ export default {
       return Response.json({ ok: true, service: "abot-gateway" });
     }
 
+    // 调试：D1 连接测试
+    if (path === "/debug/db" && request.method === "GET") {
+      try {
+        const r = await env.DB.prepare("SELECT 1 as one").first();
+        return Response.json({ ok: true, db: !!r });
+      } catch (e) {
+        return Response.json({ ok: false, error: String(e && e.message || e) });
+      }
+    }
+
     // OAuth 元数据
     if (path === "/.well-known/oauth-authorization-server") {
       const base = url.origin;
