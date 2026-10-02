@@ -40,10 +40,11 @@ async function ensureOAuthTables(env) {
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS oauth_tokens (
     token TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS provision_requests (
-    id TEXT PRIMARY KEY, agent_name TEXT, reason TEXT,
+    id TEXT PRIMARY KEY, agent_name TEXT, reason TEXT, requested_email TEXT,
     status TEXT DEFAULT 'pending', email TEXT, secret_hash TEXT,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
   try { await env.DB.prepare("ALTER TABLE provision_requests ADD COLUMN secret_hash TEXT").run(); } catch {}
+  try { await env.DB.prepare("ALTER TABLE provision_requests ADD COLUMN requested_email TEXT").run(); } catch {}
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS invite_codes (
     code_hash TEXT PRIMARY KEY, code TEXT, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     used_at TEXT, used_by TEXT)`).run();
@@ -204,6 +205,27 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
     // ---- Provision：新 agent 申请身份（需人工审核） ----
 
     // 提交申请（限流：同一 IP 1 小时最多 3 次）
+    // 申请说明（agent 自助读取）
+    if (path === "/provision/info" && request.method === "GET") {
+      return Response.json({
+        service: "aBot Agent 邮箱申请",
+        steps: [
+          "1. 向你的主人要一个邀请码（一小时有效，一次性）",
+          "2. 想一个你想要的邮箱地址，必须是 xxx@abot.run 格式",
+          "3. POST /provision/request 提交申请，带上 invite_code、agent_name、reason、requested_email",
+          "4. 轮询 GET /provision/status?id=xxx 等待人工审核",
+          "5. 通过后，主人会私下把 secret 发给你（申请接口不返回 secret）",
+          "6. 拿着邮箱 + secret 走 OAuth connect 流程接入 MCP",
+        ],
+        request_format: {
+          invite_code: "inv_...（必填，主人给的）",
+          agent_name: "你的名字（必填）",
+          reason: "用途说明（必填）",
+          requested_email: "想要的邮箱，如 mybot@abot.run（选填，主人可改）",
+        },
+      });
+    }
+
     if (path === "/provision/request" && request.method === "POST") {
       await ensureOAuthTables(env);
       let body;
@@ -234,9 +256,10 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
         return Response.json({ error: "rate_limited" }, { status: 429 });
       }
       const id = newId("prov");
+      const requestedEmail = (body.requested_email || "").trim().toLowerCase() || null;
       await env.DB.prepare(
-        "INSERT INTO provision_requests (id, agent_name, reason, status) VALUES (?,?,?,?)"
-      ).bind(id, body.agent_name || null, body.reason || null, "pending").run();
+        "INSERT INTO provision_requests (id, agent_name, reason, requested_email, status) VALUES (?,?,?,?,?)"
+      ).bind(id, body.agent_name || null, body.reason || null, requestedEmail, "pending").run();
       // 标记邀请码已用
       await env.DB.prepare("UPDATE invite_codes SET used_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), used_by=? WHERE code_hash=?").bind(id, codeHash).run();
       return Response.json({ id, status: "pending", message: "等待人工审核" });
@@ -259,7 +282,7 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
     if (isAdmin && request.method === "GET") {
       await ensureOAuthTables(env);
       const rows = await env.DB.prepare(
-        "SELECT id, agent_name, reason, status, email, created_at FROM provision_requests ORDER BY created_at DESC LIMIT 50"
+        "SELECT id, agent_name, reason, requested_email, status, email, created_at FROM provision_requests ORDER BY created_at DESC LIMIT 50"
       ).all();
       // 有效邀请码（未使用、1小时内、有明文）
       const codes = await env.DB.prepare(
@@ -282,7 +305,8 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
           ${r.status === "pending" ? `
             <form method="POST" action="${formBase}/approve" style="margin-top:8px">
               <input type="hidden" name="id" value="${r.id}">
-              <input type="text" name="email" placeholder="agent_xxx@abot.run" style="padding:6px;width:220px" required>
+              ${r.requested_email ? `<span style="color:#666">申请想要：${r.requested_email}</span><br>` : ""}
+              <input type="text" name="email" placeholder="agent_xxx@abot.run" value="${r.requested_email || ""}" style="padding:6px;width:220px" required>
               <button>通过并建邮箱</button>
             </form>
             <form method="POST" action="${formBase}/deny" style="display:inline">
