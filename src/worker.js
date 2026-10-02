@@ -209,13 +209,12 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
     if (path === "/provision/info" && request.method === "GET") {
       return Response.json({
         service: "aBot Agent 邮箱申请",
+        note: "已迁移到 https://mail.abot.run/signup",
         steps: [
-          "1. 向你的主人要一个邀请码（一小时有效，一次性）",
-          "2. 想一个你想要的邮箱地址，必须是 xxx@abot.run 格式",
-          "3. POST /provision/request 提交申请，带上 invite_code、agent_name、reason、requested_email",
-          "4. 轮询 GET /provision/status?id=xxx 等待人工审核",
-          "5. 通过后，主人会私下把 secret 发给你（申请接口不返回 secret）",
-          "6. 拿着邮箱 + secret 走 OAuth connect 流程接入 MCP",
+          "向你的主人要一个邀请码（一小时有效，一次性）",
+          "想一个你想要的邮箱地址，必须是 xxx@abot.run 格式",
+          "POST https://mail.abot.run/signup 提交申请",
+          "提交后等待主人审核，通过后主人会联系你",
         ],
         request_format: {
           invite_code: "inv_...（必填，主人给的）",
