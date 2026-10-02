@@ -48,6 +48,10 @@ async function ensureOAuthTables(env) {
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS invite_codes (
     code_hash TEXT PRIMARY KEY, code TEXT, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     used_at TEXT, used_by TEXT)`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS agent_tokens (
+    token_hash TEXT PRIMARY KEY, email TEXT NOT NULL, request_id TEXT,
+    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    revoked_at TEXT)`).run();
   // 老表补列
   try { await env.DB.prepare("ALTER TABLE invite_codes ADD COLUMN code TEXT").run(); } catch {}
 }
@@ -377,6 +381,9 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       const secretHash = await sha256hex(secret);
       await env.DB.prepare("UPDATE provision_requests SET status='approved', email=?, secret_hash=? WHERE id=?")
         .bind(email, secretHash, id).run();
+      // 同步到权限表（网关 MCP 鉴权查这张）
+      await env.DB.prepare("INSERT OR REPLACE INTO agent_tokens (token_hash, email, request_id) VALUES (?,?,?)")
+        .bind(secretHash, email, id).run();
       // 建 mailbox 记录（mail 服务读这张表做隔离）
       await env.DB.prepare(`CREATE TABLE IF NOT EXISTS mailboxes (
         email TEXT PRIMARY KEY, request_id TEXT, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
@@ -387,16 +394,25 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
 
     // ---- 以下为 MCP 代理（需鉴权） ----
 
-    // 对外鉴权：GATEWAY_TOKEN 或 OAuth token
+    // 对外鉴权：GATEWAY_TOKEN / OAuth token / agent secret(ask_)
     const auth = request.headers.get("Authorization") || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     let authed = false;
+    let agentEmail = null;
     if (env.GATEWAY_TOKEN && token === env.GATEWAY_TOKEN) {
       authed = true;
     } else if (token.startsWith("abot_")) {
       await ensureOAuthTables(env);
       const row = await env.DB.prepare("SELECT token FROM oauth_tokens WHERE token=?").bind(token).first();
       if (row) authed = true;
+    } else if (token.startsWith("ask_")) {
+      await ensureOAuthTables(env);
+      const h = await sha256hex(token);
+      const row = await env.DB.prepare("SELECT email FROM agent_tokens WHERE token_hash=? AND revoked_at IS NULL").bind(h).first();
+      if (row) {
+        authed = true;
+        agentEmail = row.email;
+      }
     }
     if (!authed) {
       return Response.json({ error: "unauthorized" }, { status: 401 });
@@ -431,7 +447,12 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
 
     const headers = new Headers(request.headers);
     headers.set("X-Internal-Token", internalToken);
-    // 保留原始 Authorization（后端用它做用户身份识别）
+    // agent 身份透传（后端信任此头做隔离）
+    if (agentEmail) {
+      headers.set("X-Abot-Owner-Email", agentEmail);
+    }
+    // 移除外部 Authorization，后端只认内部 token + 身份头
+    headers.delete("Authorization");
 
     const resp = await fetch(targetUrl, {
       method: request.method,
