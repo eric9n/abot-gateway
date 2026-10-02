@@ -251,7 +251,7 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
     if (isAdmin && request.method === "GET") {
       await ensureOAuthTables(env);
       const rows = await env.DB.prepare(
-        "SELECT id, agent_name, reason, status, created_at FROM provision_requests ORDER BY created_at DESC LIMIT 50"
+        "SELECT id, agent_name, reason, status, email, created_at FROM provision_requests ORDER BY created_at DESC LIMIT 50"
       ).all();
       const formBase = (url.hostname === "admin.abot.run") ? "" : "/admin";
       const items = (rows.results || []).map((r) =>
@@ -259,10 +259,12 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
           <b>${r.agent_name || "(未命名)"}</b> <span style="color:#666">${r.id}</span><br>
           <span>${r.reason || ""}</span><br>
           <span>状态: ${r.status}</span> <span style="color:#999">${r.created_at}</span><br>
+          ${r.status === "approved" && r.email ? `<span style="color:#2e7d32">邮箱: ${r.email}</span><br>` : ""}
           ${r.status === "pending" ? `
-            <form method="POST" action="${formBase}/approve" style="display:inline">
+            <form method="POST" action="${formBase}/approve" style="margin-top:8px">
               <input type="hidden" name="id" value="${r.id}">
-              <button>通过</button>
+              <input type="text" name="email" placeholder="agent_xxx@abot.run" style="padding:6px;width:220px" required>
+              <button>通过并建邮箱</button>
             </form>
             <form method="POST" action="${formBase}/deny" style="display:inline">
               <input type="hidden" name="id" value="${r.id}">
@@ -276,6 +278,7 @@ button{padding:8px 20px;margin:4px;font-size:14px;cursor:pointer}
 .newcode{background:#e8f5e9;border:1px solid #4caf50;border-radius:8px;padding:12px;margin:12px 0;word-break:break-all}</style>
 </head><body><h2>aBot 新 Agent 审核</h2>
 ${url.searchParams.get("newcode") ? `<div class="newcode"><b>新邀请码（只显示一次，请复制）：</b><br><code>${url.searchParams.get("newcode")}</code></div>` : ""}
+${url.searchParams.get("newsecret") ? `<div class="newcode"><b>新 agent 密钥（只显示一次，请复制发给 agent）：</b><br>邮箱: <code>${url.searchParams.get("email")}</code><br>密钥: <code>${url.searchParams.get("newsecret")}</code></div>` : ""}
 <div style="margin:16px 0;padding:12px;border:1px dashed #999;border-radius:8px">
 <b>邀请码</b> <span style="color:#666">生成一次码发给 agent，申请时必填</span><br>
 <form method="POST" action="${formBase}/invite" style="display:inline"><button>生成邀请码</button></form>
@@ -303,12 +306,31 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       const form = await request.formData();
       const id = form.get("id") || "";
       const approve = path === approvePath;
-      // 通过时分配邮箱
-      const email = approve ? `agent_${id.slice(5, 13)}@abot.run` : null;
-      await env.DB.prepare("UPDATE provision_requests SET status=?, email=? WHERE id=?")
-        .bind(approve ? "approved" : "denied", email, id).run();
       const back = isAdminHost2 ? url.origin + "/" : url.origin + "/admin";
-      return Response.redirect(back, 302);
+      if (!approve) {
+        await env.DB.prepare("UPDATE provision_requests SET status='denied' WHERE id=?").bind(id).run();
+        return Response.redirect(back, 302);
+      }
+      // 通过：手动邮箱 + 生成 secret + 建 mailbox 记录
+      const email = (form.get("email") || "").trim().toLowerCase();
+      if (!email || !email.endsWith("@abot.run")) {
+        return Response.json({ error: "invalid_email", message: "邮箱必须是 xxx@abot.run" }, { status: 400 });
+      }
+      // 邮箱不能重复
+      const dup = await env.DB.prepare("SELECT id FROM provision_requests WHERE email=? AND status='approved'").bind(email).first();
+      if (dup) {
+        return Response.json({ error: "email_taken", message: "该邮箱已分配" }, { status: 400 });
+      }
+      const secret = "ask_" + [...crypto.getRandomValues(new Uint8Array(18))].map(b => b.toString(16).padStart(2, "0")).join("");
+      const secretHash = await sha256hex(secret);
+      await env.DB.prepare("UPDATE provision_requests SET status='approved', email=?, secret_hash=? WHERE id=?")
+        .bind(email, secretHash, id).run();
+      // 建 mailbox 记录（mail 服务读这张表做隔离）
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS mailboxes (
+        email TEXT PRIMARY KEY, request_id TEXT, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
+      await env.DB.prepare("INSERT OR IGNORE INTO mailboxes (email, request_id) VALUES (?,?)").bind(email, id).run();
+      // secret 只显示一次
+      return Response.redirect(back + "?newsecret=" + encodeURIComponent(secret) + "&email=" + encodeURIComponent(email), 302);
     }
 
     // ---- 以下为 MCP 代理（需鉴权） ----
