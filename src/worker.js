@@ -38,7 +38,8 @@ async function ensureOAuthTables(env) {
     code TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
     code_challenge TEXT, expires_at INTEGER NOT NULL)`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS oauth_tokens (
-    token TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`).run();
+    token TEXT PRIMARY KEY, email TEXT, created_at INTEGER NOT NULL)`).run();
+  try { await env.DB.prepare("ALTER TABLE oauth_tokens ADD COLUMN email TEXT").run(); } catch {}
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS provision_requests (
     id TEXT PRIMARY KEY, agent_name TEXT, reason TEXT, requested_email TEXT,
     status TEXT DEFAULT 'pending', email TEXT, secret_hash TEXT,
@@ -175,6 +176,25 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       await ensureOAuthTables(env);
       const form = await request.formData();
       const grantType = form.get("grant_type");
+      // password grant：邮箱+secret 换 token（给 agent 用）
+      if (grantType === "password") {
+        const username = (form.get("username") || "").trim().toLowerCase();
+        const password = (form.get("password") || "").trim();
+        if (!username || !password) {
+          return Response.json({ error: "invalid_request" }, { status: 400 });
+        }
+        const hash = await sha256hex(password);
+        const row = await env.DB.prepare(
+          "SELECT email FROM provision_requests WHERE email=? AND secret_hash=? AND status='approved'"
+        ).bind(username, hash).first();
+        if (!row) {
+          return Response.json({ error: "invalid_grant", message: "邮箱或 secret 不正确" }, { status: 401 });
+        }
+        const token = "abot_" + [...crypto.getRandomValues(new Uint8Array(18))].map(b => b.toString(16).padStart(2, "0")).join("");
+        await env.DB.prepare("INSERT INTO oauth_tokens (token, email, created_at) VALUES (?,?,?)")
+          .bind(token, row.email, Date.now()).run();
+        return Response.json({ access_token: token, token_type: "Bearer", email: row.email });
+      }
       if (grantType !== "authorization_code") {
         return Response.json({ error: "unsupported_grant_type" }, { status: 400 });
       }
@@ -394,7 +414,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
 
     // ---- 以下为 MCP 代理（需鉴权） ----
 
-    // 对外鉴权：GATEWAY_TOKEN / OAuth token / agent secret(ask_)
+    // 对外鉴权：GATEWAY_TOKEN / OAuth token(abot_)
     const auth = request.headers.get("Authorization") || "";
     const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
     let authed = false;
@@ -403,15 +423,10 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       authed = true;
     } else if (token.startsWith("abot_")) {
       await ensureOAuthTables(env);
-      const row = await env.DB.prepare("SELECT token FROM oauth_tokens WHERE token=?").bind(token).first();
-      if (row) authed = true;
-    } else if (token.startsWith("ask_")) {
-      await ensureOAuthTables(env);
-      const h = await sha256hex(token);
-      const row = await env.DB.prepare("SELECT email FROM agent_tokens WHERE token_hash=? AND revoked_at IS NULL").bind(h).first();
+      const row = await env.DB.prepare("SELECT email FROM oauth_tokens WHERE token=?").bind(token).first();
       if (row) {
         authed = true;
-        agentEmail = row.email;
+        agentEmail = row.email || null;
       }
     }
     if (!authed) {
