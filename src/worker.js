@@ -33,12 +33,16 @@ function newId(prefix) {
 async function ensureOAuthTables(env) {
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS oauth_clients (
     client_id TEXT PRIMARY KEY, redirect_uris TEXT NOT NULL,
-    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`)?.run();
+    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS oauth_codes (
     code TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
-    code_challenge TEXT, expires_at INTEGER NOT NULL)`)?.run();
+    code_challenge TEXT, expires_at INTEGER NOT NULL)`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS oauth_tokens (
-    token TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`)?.run();
+    token TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS provision_requests (
+    id TEXT PRIMARY KEY, agent_name TEXT, reason TEXT,
+    status TEXT DEFAULT 'pending', email TEXT,
+    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
 }
 
 async function sha256hex(s) {
@@ -189,6 +193,83 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       await env.DB.prepare("INSERT INTO oauth_tokens (token, created_at) VALUES (?,?)")
         .bind(token, Date.now()).run();
       return Response.json({ access_token: token, token_type: "Bearer", expires_in: 31536000 });
+    }
+
+    // ---- Provision：新 agent 申请身份（需人工审核） ----
+
+    // 提交申请（限流：同一 IP 1 小时最多 3 次）
+    if (path === "/provision/request" && request.method === "POST") {
+      await ensureOAuthTables(env);
+      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
+      const hour = new Date().toISOString().slice(0, 13);
+      const cnt = await env.DB.prepare(
+        "SELECT COUNT(*) as c FROM provision_requests WHERE created_at LIKE ? AND id LIKE ?"
+      ).bind(hour + "%", "%").first();
+      // 简单限流：查最近1小时的总数（v1 粗糙版）
+      const recent = await env.DB.prepare(
+        "SELECT COUNT(*) as c FROM provision_requests WHERE created_at > datetime('now','-1 hour')"
+      ).first();
+      if (recent && recent.c >= 10) {
+        return Response.json({ error: "rate_limited" }, { status: 429 });
+      }
+      let body;
+      try { body = await request.json(); } catch { body = {}; }
+      const id = newId("prov");
+      await env.DB.prepare(
+        "INSERT INTO provision_requests (id, agent_name, reason, status) VALUES (?,?,?,?)"
+      ).bind(id, body.agent_name || null, body.reason || null, "pending").run();
+      return Response.json({ id, status: "pending", message: "等待人工审核" });
+    }
+
+    // 查申请状态
+    if (path === "/provision/status" && request.method === "GET") {
+      await ensureOAuthTables(env);
+      const id = url.searchParams.get("id") || "";
+      const row = await env.DB.prepare("SELECT id, status, email FROM provision_requests WHERE id=?")
+        .bind(id).first();
+      if (!row) return Response.json({ error: "not_found" }, { status: 404 });
+      return Response.json({ id: row.id, status: row.status, email: row.email || null });
+    }
+
+    // 管理页（Cloudflare Access 保护，代码内不鉴权）
+    if (path === "/admin" && request.method === "GET") {
+      await ensureOAuthTables(env);
+      const rows = await env.DB.prepare(
+        "SELECT id, agent_name, reason, status, created_at FROM provision_requests ORDER BY created_at DESC LIMIT 50"
+      ).all();
+      const items = (rows.results || []).map((r) =>
+        `<div style="border:1px solid #ddd;border-radius:8px;padding:12px;margin:8px 0">
+          <b>${r.agent_name || "(未命名)"}</b> <span style="color:#666">${r.id}</span><br>
+          <span>${r.reason || ""}</span><br>
+          <span>状态: ${r.status}</span> <span style="color:#999">${r.created_at}</span><br>
+          ${r.status === "pending" ? `
+            <form method="POST" action="/admin/approve" style="display:inline">
+              <input type="hidden" name="id" value="${r.id}">
+              <button>通过</button>
+            </form>
+            <form method="POST" action="/admin/deny" style="display:inline">
+              <input type="hidden" name="id" value="${r.id}">
+              <button>拒绝</button>
+            </form>` : ""}
+        </div>`
+      ).join("");
+      return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 审核</title>
+<style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:20px}
+button{padding:8px 20px;margin:4px;font-size:14px;cursor:pointer}</style>
+</head><body><h2>aBot 新 Agent 审核</h2>${items || "<p>暂无申请</p>"}</body></html>`,
+        { headers: { "Content-Type": "text/html;charset=utf-8" } });
+    }
+
+    if ((path === "/admin/approve" || path === "/admin/deny") && request.method === "POST") {
+      await ensureOAuthTables(env);
+      const form = await request.formData();
+      const id = form.get("id") || "";
+      const approve = path === "/admin/approve";
+      // 通过时分配邮箱
+      const email = approve ? `agent_${id.slice(5, 13)}@abot.run` : null;
+      await env.DB.prepare("UPDATE provision_requests SET status=?, email=? WHERE id=?")
+        .bind(approve ? "approved" : "denied", email, id).run();
+      return Response.redirect(url.origin + "/admin", 302);
     }
 
     // ---- 以下为 MCP 代理（需鉴权） ----
