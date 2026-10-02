@@ -43,9 +43,12 @@ async function ensureOAuthTables(env) {
     id TEXT PRIMARY KEY, agent_name TEXT, reason TEXT,
     status TEXT DEFAULT 'pending', email TEXT, secret_hash TEXT,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
+  try { await env.DB.prepare("ALTER TABLE provision_requests ADD COLUMN secret_hash TEXT").run(); } catch {}
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS invite_codes (
     code_hash TEXT PRIMARY KEY, code TEXT, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     used_at TEXT, used_by TEXT)`).run();
+  // 老表补列
+  try { await env.DB.prepare("ALTER TABLE invite_codes ADD COLUMN code TEXT").run(); } catch {}
 }
 
 async function sha256hex(s) {
