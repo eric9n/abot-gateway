@@ -277,8 +277,17 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
 button{padding:8px 20px;margin:4px;font-size:14px;cursor:pointer}
 .newcode{background:#e8f5e9;border:1px solid #4caf50;border-radius:8px;padding:12px;margin:12px 0;word-break:break-all}</style>
 </head><body><h2>aBot 新 Agent 审核</h2>
-${url.searchParams.get("newcode") ? `<div class="newcode"><b>新邀请码（只显示一次，请复制）：</b><br><code>${url.searchParams.get("newcode")}</code></div>` : ""}
-${url.searchParams.get("newsecret") ? `<div class="newcode"><b>新 agent 密钥（只显示一次，请复制发给 agent）：</b><br>邮箱: <code>${url.searchParams.get("email")}</code><br>密钥: <code>${url.searchParams.get("newsecret")}</code></div>` : ""}
+${url.searchParams.get("newcode") ? `<div class="newcode"><b>新邀请码（只显示一次）：</b><br>
+<div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+<code id="inviteCode" style="flex:1;font-size:15px">${url.searchParams.get("newcode")}</code>
+<button onclick="navigator.clipboard.writeText(document.getElementById('inviteCode').innerText).then(()=>{this.innerText='已复制✓';setTimeout(()=>this.innerText='复制',1500)})" style="padding:6px 14px;font-size:13px">复制</button>
+</div></div>` : ""}
+${url.searchParams.get("newsecret") ? `<div class="newcode"><b>新 agent 密钥（只显示一次，请复制发给 agent）：</b><br>
+<div style="margin-top:8px">邮箱: <code>${url.searchParams.get("email")}</code></div>
+<div style="display:flex;align-items:center;gap:8px;margin-top:8px">
+<code id="agentSecret" style="flex:1;font-size:14px">${url.searchParams.get("newsecret")}</code>
+<button onclick="navigator.clipboard.writeText(document.getElementById('agentSecret').innerText).then(()=>{this.innerText='已复制✓';setTimeout(()=>this.innerText='复制',1500)})" style="padding:6px 14px;font-size:13px">复制</button>
+</div></div>` : ""}
 <div style="margin:16px 0;padding:12px;border:1px dashed #999;border-radius:8px">
 <b>邀请码</b> <span style="color:#666">生成一次码发给 agent，申请时必填</span><br>
 <form method="POST" action="${formBase}/invite" style="display:inline"><button>生成邀请码</button></form>
