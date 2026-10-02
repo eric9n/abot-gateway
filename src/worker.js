@@ -65,8 +65,7 @@ export default {
 
     const headers = new Headers(request.headers);
     headers.set("X-Internal-Token", internalToken);
-    // 去掉外部 Authorization，避免泄露到后端
-    headers.delete("Authorization");
+    // 保留原始 Authorization（后端用它做用户身份识别）
 
     const resp = await fetch(targetUrl, {
       method: request.method,
@@ -74,8 +73,28 @@ export default {
       body: ["GET", "HEAD"].includes(request.method) ? null : await request.arrayBuffer(),
     });
 
-    // 透传响应
+    // 透传响应；如果是 MCP initialize，改写 serverInfo.name 标明服务
     const respHeaders = new Headers(resp.headers);
+    const contentType = resp.headers.get("content-type") || "";
+
+    if (contentType.includes("application/json")) {
+      const text = await resp.text();
+      try {
+        const body = JSON.parse(text);
+        if (body.result && body.result.serverInfo && body.result.serverInfo.name) {
+          const origName = body.result.serverInfo.name;
+          const svc = prefix.replace(/^\//, "").replace(/\/$/, "");
+          body.result.serverInfo.name = `abot-gateway/${svc} (${origName})`;
+          return new Response(JSON.stringify(body), {
+            status: resp.status, headers: respHeaders,
+          });
+        }
+      } catch {
+        // 不是合法 JSON，直接透传原文
+      }
+      return new Response(text, { status: resp.status, headers: respHeaders });
+    }
+
     return new Response(resp.body, {
       status: resp.status,
       headers: respHeaders,
