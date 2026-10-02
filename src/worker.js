@@ -318,6 +318,23 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
           <span style="color:#999;font-size:12px">${c.created_at}</span>
         </div>`
       ).join("");
+      // 已批准的 agent 列表
+      const agents = await env.DB.prepare(
+        "SELECT id, agent_name, email, created_at FROM provision_requests WHERE status='approved' AND email IS NOT NULL ORDER BY created_at DESC"
+      ).all();
+      const agentItems = (agents.results || []).map((a, i) =>
+        `<div style="display:flex;align-items:center;gap:8px;margin:6px 0;padding:8px;border:1px solid #ddd;border-radius:6px">
+          <div style="flex:1"><b>${a.agent_name || "(未命名)"}</b><br><code>${a.email}</code></div>
+          <form method="POST" action="${formBase}/rotate" style="display:inline">
+            <input type="hidden" name="id" value="${a.id}">
+            <button style="padding:4px 12px;font-size:12px">换 Secret</button>
+          </form>
+          <form method="POST" action="${formBase}/revoke" style="display:inline">
+            <input type="hidden" name="id" value="${a.id}">
+            <button style="padding:4px 12px;font-size:12px;background:#ffebee">吊销</button>
+          </form>
+        </div>`
+      ).join("");
       const formBase = (url.hostname === "admin.abot.run") ? "" : "/admin";
       const items = (rows.results || []).map((r) =>
         `<div style="border:1px solid #ddd;border-radius:8px;padding:12px;margin:8px 0">
@@ -359,6 +376,10 @@ ${url.searchParams.get("newsecret") ? `<div class="newcode"><b>新 agent 密钥�
 <form method="POST" action="${formBase}/invite" style="display:inline"><button>生成邀请码</button></form>
 ${codeItems ? `<div style="margin-top:8px"><b>有效邀请码：</b>${codeItems}</div>` : `<div style="color:#999;margin-top:8px">暂无有效邀请码</div>`}
 </div>
+<div style="margin:16px 0;padding:12px;border:1px solid #999;border-radius:8px">
+<b>已接入 Agent</b> <span style="color:#666">换 Secret 后旧 secret 失效，需重新发给 agent；吊销后该邮箱所有 token 失效</span>
+${agentItems || `<div style="color:#999;margin-top:8px">暂无</div>`}
+</div>
 ${items || "<p>暂无申请</p>"}</body></html>`,
         { headers: { "Content-Type": "text/html;charset=utf-8" } });
     }
@@ -367,6 +388,39 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
     const approvePath = isAdminHost2 ? "/approve" : "/admin/approve";
     const denyPath = isAdminHost2 ? "/deny" : "/admin/deny";
     const invitePath = isAdminHost2 ? "/invite" : "/admin/invite";
+    const rotatePath = isAdminHost2 ? "/rotate" : "/admin/rotate";
+    const revokePath = isAdminHost2 ? "/revoke" : "/admin/revoke";
+    // 吊销：该邮箱所有 token 失效
+    if (path === revokePath && request.method === "POST") {
+      await ensureOAuthTables(env);
+      const form = await request.formData();
+      const id = form.get("id") || "";
+      const req = await env.DB.prepare("SELECT email FROM provision_requests WHERE id=?").bind(id).first();
+      if (req && req.email) {
+        await env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=?").bind(req.email).run();
+        await env.DB.prepare("DELETE FROM oauth_tokens WHERE email=?").bind(req.email).run();
+      }
+      const back = isAdminHost2 ? url.origin + "/" : url.origin + "/admin";
+      return Response.redirect(back, 302);
+    }
+    // 换 Secret：生成新的 ask_，旧的失效
+    if (path === rotatePath && request.method === "POST") {
+      await ensureOAuthTables(env);
+      const form = await request.formData();
+      const id = form.get("id") || "";
+      const req = await env.DB.prepare("SELECT email FROM provision_requests WHERE id=? AND status='approved'").bind(id).first();
+      const back = isAdminHost2 ? url.origin + "/" : url.origin + "/admin";
+      if (!req || !req.email) return Response.redirect(back, 302);
+      const secret = "ask_" + [...crypto.getRandomValues(new Uint8Array(18))].map(b => b.toString(16).padStart(2, "0")).join("");
+      const secretHash = await sha256hex(secret);
+      // 吊销旧 token
+      await env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=?").bind(req.email).run();
+      await env.DB.prepare("DELETE FROM oauth_tokens WHERE email=?").bind(req.email).run();
+      // 写入新 secret
+      await env.DB.prepare("UPDATE provision_requests SET secret_hash=? WHERE id=?").bind(secretHash, id).run();
+      await env.DB.prepare("INSERT INTO agent_tokens (token_hash, email, request_id) VALUES (?,?,?)").bind(secretHash, req.email, id).run();
+      return Response.redirect(back + "?newsecret=" + encodeURIComponent(secret) + "&email=" + encodeURIComponent(req.email), 302);
+    }
     // 生成邀请码（只显示一次）
     if (path === invitePath && request.method === "POST") {
       await ensureOAuthTables(env);
