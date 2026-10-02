@@ -261,9 +261,9 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       const rows = await env.DB.prepare(
         "SELECT id, agent_name, reason, status, email, created_at FROM provision_requests ORDER BY created_at DESC LIMIT 50"
       ).all();
-      // 有效邀请码（未使用、1小时内）
+      // 有效邀请码（未使用、1小时内、有明文）
       const codes = await env.DB.prepare(
-        "SELECT code, created_at FROM invite_codes WHERE used_at IS NULL AND created_at > datetime('now','-1 hour') ORDER BY created_at DESC"
+        "SELECT code, created_at FROM invite_codes WHERE used_at IS NULL AND code IS NOT NULL AND created_at > datetime('now','-1 hour') ORDER BY created_at DESC"
       ).all();
       const codeItems = (codes.results || []).map((c, i) =>
         `<div style="display:flex;align-items:center;gap:8px;margin:4px 0">
