@@ -41,8 +41,11 @@ async function ensureOAuthTables(env) {
     token TEXT PRIMARY KEY, created_at INTEGER NOT NULL)`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS provision_requests (
     id TEXT PRIMARY KEY, agent_name TEXT, reason TEXT,
-    status TEXT DEFAULT 'pending', email TEXT,
+    status TEXT DEFAULT 'pending', email TEXT, secret_hash TEXT,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS invite_codes (
+    code_hash TEXT PRIMARY KEY, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    used_at TEXT, used_by TEXT)`).run();
 }
 
 async function sha256hex(s) {
@@ -200,24 +203,34 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
     // 提交申请（限流：同一 IP 1 小时最多 3 次）
     if (path === "/provision/request" && request.method === "POST") {
       await ensureOAuthTables(env);
-      const ip = request.headers.get("CF-Connecting-IP") || "unknown";
-      const hour = new Date().toISOString().slice(0, 13);
-      const cnt = await env.DB.prepare(
-        "SELECT COUNT(*) as c FROM provision_requests WHERE created_at LIKE ? AND id LIKE ?"
-      ).bind(hour + "%", "%").first();
-      // 简单限流：查最近1小时的总数（v1 粗糙版）
+      let body;
+      try { body = await request.json(); } catch { body = {}; }
+      // 邀请码必填，一次性
+      const inviteCode = (body.invite_code || "").trim();
+      if (!inviteCode) {
+        return Response.json({ error: "invite_code_required", message: "需要邀请码才能申请" }, { status: 400 });
+      }
+      const codeHash = await sha256hex(inviteCode);
+      const codeRow = await env.DB.prepare("SELECT code_hash, used_at FROM invite_codes WHERE code_hash=?").bind(codeHash).first();
+      if (!codeRow) {
+        return Response.json({ error: "invalid_invite_code" }, { status: 403 });
+      }
+      if (codeRow.used_at) {
+        return Response.json({ error: "invite_code_used" }, { status: 403 });
+      }
+      // 简单限流：最近1小时最多10个申请
       const recent = await env.DB.prepare(
         "SELECT COUNT(*) as c FROM provision_requests WHERE created_at > datetime('now','-1 hour')"
       ).first();
       if (recent && recent.c >= 10) {
         return Response.json({ error: "rate_limited" }, { status: 429 });
       }
-      let body;
-      try { body = await request.json(); } catch { body = {}; }
       const id = newId("prov");
       await env.DB.prepare(
         "INSERT INTO provision_requests (id, agent_name, reason, status) VALUES (?,?,?,?)"
       ).bind(id, body.agent_name || null, body.reason || null, "pending").run();
+      // 标记邀请码已用
+      await env.DB.prepare("UPDATE invite_codes SET used_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), used_by=? WHERE code_hash=?").bind(id, codeHash).run();
       return Response.json({ id, status: "pending", message: "等待人工审核" });
     }
 
@@ -259,14 +272,32 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       ).join("");
       return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 审核</title>
 <style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:20px}
-button{padding:8px 20px;margin:4px;font-size:14px;cursor:pointer}</style>
-</head><body><h2>aBot 新 Agent 审核</h2>${items || "<p>暂无申请</p>"}</body></html>`,
+button{padding:8px 20px;margin:4px;font-size:14px;cursor:pointer}
+.newcode{background:#e8f5e9;border:1px solid #4caf50;border-radius:8px;padding:12px;margin:12px 0;word-break:break-all}</style>
+</head><body><h2>aBot 新 Agent 审核</h2>
+${url.searchParams.get("newcode") ? `<div class="newcode"><b>新邀请码（只显示一次，请复制）：</b><br><code>${url.searchParams.get("newcode")}</code></div>` : ""}
+<div style="margin:16px 0;padding:12px;border:1px dashed #999;border-radius:8px">
+<b>邀请码</b> <span style="color:#666">生成一次码发给 agent，申请时必填</span><br>
+<form method="POST" action="${formBase}/invite" style="display:inline"><button>生成邀请码</button></form>
+</div>
+${items || "<p>暂无申请</p>"}</body></html>`,
         { headers: { "Content-Type": "text/html;charset=utf-8" } });
     }
 
     const isAdminHost2 = url.hostname === "admin.abot.run";
     const approvePath = isAdminHost2 ? "/approve" : "/admin/approve";
     const denyPath = isAdminHost2 ? "/deny" : "/admin/deny";
+    const invitePath = isAdminHost2 ? "/invite" : "/admin/invite";
+    // 生成邀请码（只显示一次）
+    if (path === invitePath && request.method === "POST") {
+      await ensureOAuthTables(env);
+      const code = "inv_" + [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, "0")).join("");
+      const hash = await sha256hex(code);
+      await env.DB.prepare("INSERT INTO invite_codes (code_hash) VALUES (?)").bind(hash).run();
+      const back = isAdminHost2 ? url.origin + "/" : url.origin + "/admin";
+      // 通过 query 参数一次性显示（简单版）
+      return Response.redirect(back + "?newcode=" + encodeURIComponent(code), 302);
+    }
     if ((path === approvePath || path === denyPath) && request.method === "POST") {
       await ensureOAuthTables(env);
       const form = await request.formData();
