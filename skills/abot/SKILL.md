@@ -14,8 +14,9 @@ aBot Gateway 把 mail、data、health、rules、secrets 五个后端合成一个
 
 在 dumper 生成 `references/` 之前，不要根据这些文件猜测参数或调用网关。
 
-安装：
+安装（需要 git；Origin 没有免认证 raw 文件，不能 curl 下载脚本）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dagow/abot-gateway/main/install-skills.sh | bash
+git clone --depth 1 https://origin.cursor.com/git/dagow/abot-gateway.git
+bash abot-gateway/install-skills.sh
 ```
