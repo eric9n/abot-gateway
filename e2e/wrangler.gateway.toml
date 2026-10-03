@@ -1,0 +1,32 @@
+# 仅供本地 e2e（wrangler dev）。不要用本文件 wrangler deploy。
+# CI 部署读的是仓库根目录的 wrangler.toml，不会用到这个文件。
+# service 名与线上 Worker 脚本名一致；本地进程是 e2e/mock-backend.js，不是真实后端。
+name = "abot-gateway"
+main = "../src/worker.js"
+compatibility_date = "2024-11-05"
+workers_dev = false
+
+[[d1_databases]]
+binding = "DB"
+database_name = "abot-gateway-e2e"
+database_id = "11111111-1111-4111-8111-111111111111"
+
+[[services]]
+binding = "BACKEND_DATA"
+service = "abot-data"
+
+[[services]]
+binding = "BACKEND_MAIL"
+service = "resend-agent-mail-relay"
+
+[[services]]
+binding = "BACKEND_HEALTH"
+service = "abot-health"
+
+[[services]]
+binding = "BACKEND_RULES"
+service = "abot-rules"
+
+[[services]]
+binding = "BACKEND_SECRETS"
+service = "abot-secrets"
