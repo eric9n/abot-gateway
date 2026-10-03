@@ -1,6 +1,7 @@
-// 基础测试：验证 worker.js 语法和关键逻辑
+// 基础测试：验证 worker.js 语法、关键逻辑，以及 Service Binding 代理行为
 import { readFileSync } from 'fs';
 import { execSync } from 'child_process';
+import worker from '../src/worker.js';
 
 console.log('1. 检查 worker.js 语法...');
 try {
@@ -21,8 +22,8 @@ try {
 }
 
 console.log('3. 检查占位符...');
-const worker = readFileSync('src/worker.js', 'utf8');
-if (!worker.includes('/*__ADMIN_JS__*/')) {
+const workerSrc = readFileSync('src/worker.js', 'utf8');
+if (!workerSrc.includes('/*__ADMIN_JS__*/')) {
   console.error('   ✗ 缺少 /*__ADMIN_JS__*/ 占位符');
   process.exit(1);
 }
@@ -31,7 +32,7 @@ console.log('   ✓ 占位符存在');
 console.log('4. 检查关键路由...');
 const routes = ['/mcp', '/oauth/authorize', '/oauth/token', '/oauth/register', '/admin'];
 for (const r of routes) {
-  if (!worker.includes(`"${r}"`) && !worker.includes(`'${r}'`)) {
+  if (!workerSrc.includes(`"${r}"`) && !workerSrc.includes(`'${r}'`)) {
     console.error(`   ✗ 缺少路由 ${r}`);
     process.exit(1);
   }
@@ -49,7 +50,7 @@ const checks = [
   ['crypto.getRandomValues', '安全随机数'],
 ];
 for (const [s, name] of checks) {
-  if (!worker.includes(s)) { console.error(`   ✗ 缺少 ${name}`); process.exit(1); }
+  if (!workerSrc.includes(s)) { console.error(`   ✗ 缺少 ${name}`); process.exit(1); }
 }
 console.log('   ✓ 安全项齐全');
 
@@ -59,10 +60,207 @@ const bad = [
   ['/debug/db', '调试端点'],
   ['String(e.message || e)', '错误泄漏'],
   ['GATEWAY_TOKEN', '已删除的静态 token'],
+  ['workers.dev', '公网 workers.dev 后端地址'],
+  ['token_env', '内部 token 环境变量映射'],
+  ['INTERNAL_DATA', '内部 token secret'],
+  ['INTERNAL_MAIL', '内部 token secret'],
+  ['INTERNAL_HEALTH', '内部 token secret'],
+  ['INTERNAL_RULES', '内部 token secret'],
+  ['INTERNAL_SECRETS', '内部 token secret'],
+  ['set("X-Internal-Token"', '设置内部 token 头'],
+  ["set('X-Internal-Token'", '设置内部 token 头'],
 ];
 for (const [s, name] of bad) {
-  if (worker.includes(s)) { console.error(`   ✗ 发现 ${name}: ${s}`); process.exit(1); }
+  if (workerSrc.includes(s)) { console.error(`   ✗ 发现 ${name}: ${s}`); process.exit(1); }
 }
 console.log('   ✓ 无危险模式');
+
+console.log('7. 检查 Service Binding...');
+const bindings = ['BACKEND_DATA', 'BACKEND_MAIL', 'BACKEND_HEALTH', 'BACKEND_RULES', 'BACKEND_SECRETS'];
+for (const name of bindings) {
+  if (!workerSrc.includes(name)) { console.error(`   ✗ 缺少 binding ${name}`); process.exit(1); }
+}
+for (const s of ['backend_unavailable', 'X-Abot-Owner-Email', 'serviceBinding(', 'backend.internal']) {
+  if (!workerSrc.includes(s)) { console.error(`   ✗ 缺少 ${s}`); process.exit(1); }
+}
+console.log('   ✓ Service Binding 映射齐全');
+
+function fail(msg) {
+  console.error('   ✗ ' + msg);
+  process.exit(1);
+}
+
+function mockDb() {
+  const stmt = {
+    bind() { return stmt; },
+    async run() { return {}; },
+    async first() { return { email: 'agent@abot.run', created_at: Date.now() }; },
+    async all() { return { results: [] }; },
+  };
+  return { prepare() { return stmt; } };
+}
+
+function authedRequest(path, init = {}) {
+  const headers = new Headers(init.headers || {});
+  if (!headers.has('Authorization')) headers.set('Authorization', 'Bearer abot_testtoken');
+  headers.set('X-Internal-Token', 'spoofed-token');
+  return new Request('https://abot.run' + path, {
+    method: init.method || 'GET',
+    headers,
+    body: init.body,
+  });
+}
+
+console.log('8. 直接代理：binding、502、身份头...');
+{
+  const gatewayHealth = await worker.fetch(new Request('https://abot.run/health'));
+  if (gatewayHealth.status !== 200) fail('网关 /health 应免认证');
+  const gatewayBody = await gatewayHealth.json();
+  if (gatewayBody.service !== 'abot-gateway') fail('网关 /health 被误代理');
+
+  const missing = await worker.fetch(authedRequest('/health/ready'), { DB: mockDb() });
+  if (missing.status !== 502) fail('未配置 binding 应返回 502，实际 ' + missing.status);
+  const missingBody = await missing.json();
+  if (missingBody.error !== 'backend_unavailable' || missingBody.service !== 'health') {
+    fail('未配置 binding 的响应体不对: ' + JSON.stringify(missingBody));
+  }
+  if (!String(missingBody.detail || '').includes('BACKEND_HEALTH')) {
+    fail('未配置 binding 应提示 BACKEND_HEALTH');
+  }
+
+  let captured = null;
+  const originalFetch = globalThis.fetch;
+  let publicFetch = 0;
+  globalThis.fetch = async (...args) => {
+    publicFetch += 1;
+    return originalFetch(...args);
+  };
+  try {
+    const ok = await worker.fetch(authedRequest('/data/v1/items?q=1', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ n: 1 }),
+    }), {
+      DB: mockDb(),
+      BACKEND_DATA: {
+        async fetch(url, init) {
+          captured = {
+            url: String(url),
+            method: init.method,
+            headers: new Headers(init.headers),
+            body: new TextDecoder().decode(init.body),
+          };
+          return Response.json({ ok: true, n: 1 });
+        },
+      },
+    });
+    if (ok.status !== 200) fail('成功代理应透传 200，实际 ' + ok.status);
+    const okBody = await ok.json();
+    if (!okBody.ok) fail('成功代理应透传正文');
+    if (!captured) fail('未调用 binding.fetch');
+    if (captured.url !== 'https://backend.internal/v1/items?q=1') fail('目标 URL 不对: ' + captured.url);
+    if (captured.method !== 'POST') fail('方法未转发');
+    if (captured.body !== '{"n":1}') fail('正文未转发: ' + captured.body);
+    if (captured.headers.get('X-Internal-Token')) fail('不应转发 X-Internal-Token');
+    if (captured.headers.get('Authorization')) fail('不应转发 Authorization');
+    if (captured.headers.get('X-Abot-Owner-Email') !== 'agent@abot.run') fail('缺少身份头');
+    if (publicFetch !== 0) fail('后端调用不应走公网 fetch');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const leaked = 'dial tcp 10.1.2.3:443: connection refused token=sekret';
+  const down = await worker.fetch(authedRequest('/mail/inbox'), {
+    DB: mockDb(),
+    BACKEND_MAIL: { async fetch() { throw new Error(leaked); } },
+  });
+  if (down.status !== 502) fail('后端抛错应返回 502');
+  const downText = await down.text();
+  if (downText.includes('10.1.2.3') || downText.includes('sekret') || downText.includes('dial tcp')) {
+    fail('后端异常泄漏了原文: ' + downText);
+  }
+  const downBody = JSON.parse(downText);
+  if (downBody.error !== 'backend_unavailable' || downBody.service !== 'mail' || downBody.detail) {
+    fail('后端抛错应返回通用 502: ' + downText);
+  }
+
+  const crashed = await worker.fetch(authedRequest('/rules/list'), {
+    DB: mockDb(),
+    BACKEND_RULES: {
+      async fetch() { return new Response('stack: /opt/secret.key', { status: 500, headers: { 'content-type': 'text/plain' } }); },
+    },
+  });
+  const crashedText = await crashed.text();
+  if (crashed.status !== 502 || crashedText.includes('secret.key') || crashedText.includes('stack:')) {
+    fail('5xx 不应透传后端原文: ' + crashed.status + ' ' + crashedText);
+  }
+
+  const missingItem = await worker.fetch(authedRequest('/secrets/nope'), {
+    DB: mockDb(),
+    BACKEND_SECRETS: {
+      async fetch() { return Response.json({ error: 'not_found' }, { status: 404 }); },
+    },
+  });
+  if (missingItem.status !== 404) fail('4xx 应透传，实际 ' + missingItem.status);
+  const missingItemBody = await missingItem.json();
+  if (missingItemBody.error !== 'not_found') fail('4xx 正文应透传');
+}
+console.log('   ✓ 直接代理行为正确');
+
+console.log('9. MCP 聚合：binding、不泄漏后端原文...');
+{
+  let captured = null;
+  const listed = await worker.fetch(authedRequest('/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'tools/list' }),
+  }), {
+    DB: mockDb(),
+    BACKEND_DATA: {
+      async fetch(url, init) {
+        captured = { url: String(url), headers: new Headers(init.headers) };
+        return Response.json({ result: { tools: [{ name: 'query', description: 'q', inputSchema: { type: 'object' } }] } });
+      },
+    },
+    BACKEND_MAIL: { async fetch() { throw new Error('mailbox password=hunter2'); } },
+  });
+  const listedBody = await listed.json();
+  const names = (listedBody.result && listedBody.result.tools || []).map((t) => t.name);
+  if (!names.includes('data_query')) fail('tools/list 应包含可用后端的工具: ' + JSON.stringify(names));
+  if (JSON.stringify(listedBody).includes('hunter2')) fail('tools/list 泄漏了失败后端的原文');
+  if (!captured || captured.url !== 'https://backend.internal/mcp') fail('MCP 未走 binding /mcp');
+  if (captured.headers.get('X-Internal-Token')) fail('MCP 不应带内部 token');
+  if (captured.headers.get('X-Abot-Owner-Email') !== 'agent@abot.run') fail('MCP 缺少身份头');
+
+  const called = await worker.fetch(authedRequest('/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 9, method: 'tools/call', params: { name: 'mail_send', arguments: { to: 'a@b.c' } } }),
+  }), {
+    DB: mockDb(),
+    BACKEND_MAIL: {
+      async fetch() { return new Response('upstream trace id=abc token rejected', { status: 502 }); },
+    },
+  });
+  const calledText = await called.text();
+  if (called.status !== 502) fail('MCP 后端失败应为 502，实际 ' + called.status);
+  if (calledText.includes('trace') || calledText.includes('token rejected')) fail('MCP 泄漏后端原文: ' + calledText);
+  const calledBody = JSON.parse(calledText);
+  if (!calledBody.error || calledBody.error.message !== 'backend unavailable: mail') {
+    fail('MCP 失败消息不对: ' + calledText);
+  }
+
+  const unbound = await worker.fetch(authedRequest('/mcp', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 4, method: 'tools/call', params: { name: 'secrets_get', arguments: {} } }),
+  }), { DB: mockDb() });
+  const unboundBody = await unbound.json();
+  if (unbound.status !== 502) fail('MCP binding 缺失应为 502');
+  if (!String(unboundBody.error && unboundBody.error.message).includes('BACKEND_SECRETS')) {
+    fail('MCP binding 缺失应提示 binding 名: ' + JSON.stringify(unboundBody));
+  }
+}
+console.log('   ✓ MCP 聚合行为正确');
 
 console.log('\n所有测试通过 ✓');

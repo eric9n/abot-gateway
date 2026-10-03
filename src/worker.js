@@ -1,10 +1,28 @@
+// 路径前缀 → Service Binding 名。请求走 env[binding].fetch()，不经公网、不带内部 token。
 const ROUTES = {
-  "/data/": { host: "https://abot-data.boliam.workers.dev", token_env: "INTERNAL_DATA" },
-  "/mail/": { host: "https://resend-agent-mail-relay.boliam.workers.dev", token_env: "INTERNAL_MAIL" },
-  "/health/": { host: "https://abot-health.boliam.workers.dev", token_env: "INTERNAL_HEALTH" },
-  "/rules/": { host: "https://abot-rules.boliam.workers.dev", token_env: "INTERNAL_RULES" },
-  "/secrets/": { host: "https://abot-secrets.boliam.workers.dev", token_env: "INTERNAL_SECRETS" },
+  "/data/": "BACKEND_DATA",
+  "/mail/": "BACKEND_MAIL",
+  "/health/": "BACKEND_HEALTH",
+  "/rules/": "BACKEND_RULES",
+  "/secrets/": "BACKEND_SECRETS",
 };
+
+function routeServiceName(prefix) {
+  return prefix.replace(/^\//, "").replace(/\/$/, "");
+}
+
+// 后端异常：固定 502，不附后端原文，避免泄漏内部信息
+function backendUnavailable(service, detail) {
+  const body = { error: "backend_unavailable", service };
+  if (detail) body.detail = detail;
+  return Response.json(body, { status: 502 });
+}
+
+function serviceBinding(env, name) {
+  const binding = env[name];
+  if (!binding || typeof binding.fetch !== "function") return null;
+  return binding;
+}
 
 function newId(prefix) {
   const r = [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(36)).join("").replace(/[^a-z0-9]/g, "");
@@ -586,29 +604,40 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
         
         // MCP 服务注册表
         const MCP_SERVICES = [
-          { prefix: "mail", route: ROUTES["/mail/"] },
-          { prefix: "data", route: ROUTES["/data/"] },
-          { prefix: "health", route: ROUTES["/health/"] },
-          { prefix: "rules", route: ROUTES["/rules/"] },
-          { prefix: "secrets", route: ROUTES["/secrets/"] },
+          { prefix: "mail", binding: ROUTES["/mail/"] },
+          { prefix: "data", binding: ROUTES["/data/"] },
+          { prefix: "health", binding: ROUTES["/health/"] },
+          { prefix: "rules", binding: ROUTES["/rules/"] },
+          { prefix: "secrets", binding: ROUTES["/secrets/"] },
         ];
         
         async function callBackend(svc, rpcPayload, timeoutMs) {
-          const token = env[svc.route.token_env];
-          if (!token) throw new Error("internal auth not configured");
+          const binding = serviceBinding(env, svc.binding);
+          if (!binding) {
+            const err = new Error("binding_not_configured");
+            err.code = "BINDING_NOT_CONFIGURED";
+            err.binding = svc.binding;
+            throw err;
+          }
           const headers = {
             "Content-Type": "application/json",
-            "X-Internal-Token": token,
+            "X-Abot-Owner-Email": agentEmail,
           };
-          headers["X-Abot-Owner-Email"] = agentEmail;
-          const resp = await fetch(svc.route.host + "/mcp", {
+          const resp = await binding.fetch("https://backend.internal/mcp", {
             method: "POST",
             headers,
             body: JSON.stringify(rpcPayload),
             signal: AbortSignal.timeout(timeoutMs || 15000),
           });
-          if (!resp.ok) throw new Error("backend error: " + resp.status);
-          return resp.json();
+          if (!resp.ok) {
+            try { await resp.body?.cancel(); } catch {}
+            throw new Error("backend_unavailable");
+          }
+          try {
+            return await resp.json();
+          } catch {
+            throw new Error("backend_unavailable");
+          }
         }
         
         if (method === "initialize") {
@@ -665,7 +694,17 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
           try {
             r = await callBackend(svc, { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: realName, arguments: args } }, 30000);
           } catch (e) {
-            return Response.json({ jsonrpc: "2.0", id: rpcId, error: { code: -32603, message: "backend unavailable: " + prefix } });
+            const missing = e && e.code === "BINDING_NOT_CONFIGURED";
+            return Response.json({
+              jsonrpc: "2.0",
+              id: rpcId,
+              error: {
+                code: -32603,
+                message: missing
+                  ? "backend unavailable: " + prefix + " (service binding " + e.binding + " is not configured)"
+                  : "backend unavailable: " + prefix,
+              },
+            }, { status: 502 });
           }
           // 透传后端的 result/error
           if (r.error) {
@@ -694,31 +733,38 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       return Response.json({ error: "unknown service, use /data/, /mail/, /health/, /rules/, /secrets/" }, { status: 404 });
     }
 
-    // 解析目标 host（均为 workers.dev 或自有域名内部直连）
-    const targetHost = route.host;
-
-    // 内部 token
-    const internalToken = env[route.token_env];
-    if (!internalToken) {
-      return Response.json({ error: "internal auth not configured for " + prefix }, { status: 502 });
+    const bindingName = route;
+    const serviceName = routeServiceName(prefix);
+    const binding = serviceBinding(env, bindingName);
+    if (!binding) {
+      return backendUnavailable(serviceName, "service binding " + bindingName + " is not configured");
     }
 
-    // 透传：去掉前缀，拼目标 URL
+    // 去掉网关前缀。Service Binding 按 binding 路由，hostname 不走公网。
     const rest = path.slice(prefix.length);
-    const targetUrl = targetHost + "/" + rest + url.search;
+    const targetUrl = "https://backend.internal/" + rest + url.search;
 
     const headers = new Headers(request.headers);
-    headers.set("X-Internal-Token", internalToken);
+    headers.delete("X-Internal-Token");
     // agent 身份透传（后端信任此头做隔离）
     headers.set("X-Abot-Owner-Email", agentEmail);
-    // 移除外部 Authorization，后端只认内部 token + 身份头
     headers.delete("Authorization");
 
-    const resp = await fetch(targetUrl, {
-      method: request.method,
-      headers,
-      body: ["GET", "HEAD"].includes(request.method) ? null : await request.arrayBuffer(),
-    });
+    let resp;
+    try {
+      resp = await binding.fetch(targetUrl, {
+        method: request.method,
+        headers,
+        body: ["GET", "HEAD"].includes(request.method) ? null : await request.arrayBuffer(),
+      });
+    } catch {
+      return backendUnavailable(serviceName);
+    }
+
+    if (resp.status >= 500) {
+      try { await resp.body?.cancel(); } catch {}
+      return backendUnavailable(serviceName);
+    }
 
     // 透传响应；如果是 MCP initialize，改写 serverInfo.name 标明服务
     const respHeaders = new Headers(resp.headers);
