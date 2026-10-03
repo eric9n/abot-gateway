@@ -1,1 +1,5 @@
 dist/
+node_modules/
+.wrangler/
+e2e/.state/
+e2e/.logs/

@@ -1,1 +1,1 @@
-{"description":"aBot 统一网关","name":"abot-gateway","scripts":{"build":"node build.js","test":"node test/basic.js"},"version":"1.0.0"}
+{"description":"aBot 统一网关","name":"abot-gateway","scripts":{"build":"node build.js","e2e":"node e2e/run.mjs","test":"node test/basic.js"},"version":"1.0.0","devDependencies":{"wrangler":"^4.147.0"}}

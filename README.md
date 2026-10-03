@@ -7,6 +7,7 @@
 ```bash
 npm test          # 跑测试
 npm run build     # 构建 dist/worker.js
+npm run e2e       # 本地 wrangler dev + mock 后端。不是 Cloudflare 部署，人工步骤见 e2e/README.md
 ```
 
 ## 部署
