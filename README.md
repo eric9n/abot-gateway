@@ -32,6 +32,16 @@ Binding 未配置时返回 `502`，并带上缺少哪个 binding。后端抛错�
 
 网关不再使用 `INTERNAL_DATA` / `INTERNAL_MAIL` / `INTERNAL_HEALTH` / `INTERNAL_RULES` / `INTERNAL_SECRETS`。后端改为信任 Service Binding 之后，这些 secret 可以删掉。本仓库不包含后端，合并本改动前需要后端不再强制校验内部 token，否则内部调用会失败。
 
+## 安装 skills
+
+Agent 一条命令安装到 `~/.muse/skills/abot/`（有 git 时 sparse-checkout 只拉 `skills/abot`，没有 git 时 curl 逐文件下载）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dagow/abot-gateway/main/install-skills.sh | bash
+```
+
+`skills/abot/references/` 目前是占位，由后续 dumper 生成。
+
 ## 结构
 
 - `src/worker.js`：网关主逻辑（含 `/*__ADMIN_JS__*/` 占位符）
@@ -39,3 +49,5 @@ Binding 未配置时返回 `502`，并带上缺少哪个 binding。后端抛错�
 - `test/basic.js`：基础测试
 - `build.js`：构建脚本
 - `wrangler.toml.example`：需要合并进现有配置的 5 个 service bindings
+- `skills/abot/`：给 agent 的 skill 包（`SKILL.md`、`bin/abot-mcp`、`references/`）
+- `install-skills.sh`：把 `skills/abot` 装到 `~/.muse/skills/abot/`
