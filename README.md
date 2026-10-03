@@ -43,7 +43,7 @@ bash abot-gateway/install-skills.sh
 
 已经有这份脚本时直接 `./install-skills.sh`。脚本用 sparse-checkout 只拉 `skills/abot`，装到 `~/.muse/skills/abot/`。没有 git 时脚本会退出并说明原因。
 
-`skills/abot/references/` 目前是占位，由后续 dumper 生成。
+`skills/abot/references/` 在仓库里手写维护，不自动生成。
 
 ## 结构
 

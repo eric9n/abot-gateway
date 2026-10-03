@@ -4,6 +4,6 @@
 printf '%s\n' \
   'abot-mcp 是占位文件，还不能连接 aBot Gateway。' \
   '技能目录：~/.muse/skills/abot/' \
-  'references/ 里的 mail、health、data、rules、secrets 也是占位，等 dumper 生成后再用。' \
+  '工具说明在 references/，在仓库里手写维护。' \
   >&2
 exit 1

@@ -35,6 +35,11 @@ for f in install-skills.sh README.md skills/abot/SKILL.md; do
   fi
 done
 
+[[ ! -e skills/abot/bin/dump-tools ]] || fail "dump-tools should not exist"
+if grep -R -E -n 'dumper|dump-tools' install-skills.sh README.md skills; then
+  fail "dumper references remain"
+fi
+
 TMP="$(mktemp -d)"
 cleanup() { rm -rf "${TMP}"; }
 trap cleanup EXIT
