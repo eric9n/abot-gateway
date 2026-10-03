@@ -34,13 +34,16 @@ Binding 未配置时返回 `502`，并带上缺少哪个 binding。后端抛错�
 
 ## 安装 skills
 
-Agent 一条命令安装到 `~/.muse/skills/abot/`（有 git 时 sparse-checkout 只拉 `skills/abot`，没有 git 时 curl 逐文件下载）：
+仓库在 Cursor Origin，不在 GitHub。Origin 没有免认证 raw 文件，不能 `curl | bash`。需要 git，并且当前环境能克隆该仓库（例如已经 `origin auth login`）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dagow/abot-gateway/main/install-skills.sh | bash
+git clone --depth 1 https://origin.cursor.com/git/dagow/abot-gateway.git
+bash abot-gateway/install-skills.sh
 ```
 
-`skills/abot/references/` 目前是占位，由后续 dumper 生成。
+已经有这份脚本时直接 `./install-skills.sh`。脚本用 sparse-checkout 只拉 `skills/abot`，装到 `~/.muse/skills/abot/`。没有 git 时脚本会退出并说明原因。
+
+`skills/abot/references/` 在仓库里手写维护，不自动生成。
 
 ## 结构
 

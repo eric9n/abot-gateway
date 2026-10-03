@@ -263,4 +263,7 @@ console.log('9. MCP 聚合：binding、不泄漏后端原文...');
 }
 console.log('   ✓ MCP 聚合行为正确');
 
+console.log('检查 install-skills.sh 的仓库地址...');
+execSync('bash test/install-skills-urls.sh', { stdio: 'inherit' });
+
 console.log('\n所有测试通过 ✓');
