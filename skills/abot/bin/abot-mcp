@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# 占位说明：真实 abot-mcp 客户端还没放进这个包。
+# 安装脚本会 chmod +x 本文件。运行它只打印说明并退出。
+printf '%s\n' \
+  'abot-mcp 是占位文件，还不能连接 aBot Gateway。' \
+  '技能目录：~/.muse/skills/abot/' \
+  'references/ 里的 mail、health、data、rules、secrets 也是占位，等 dumper 生成后再用。' \
+  >&2
+exit 1
