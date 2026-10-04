@@ -44,6 +44,13 @@ function internalError() {
   return Response.json({ ok: false, error: "internal_error" }, { status: 500 });
 }
 
+// created_at 统一按 ISO（strftime %Y-%m-%dT%H:%M:%fZ）比较。isoTime() 把老格式 'YYYY-MM-DD HH:MM:SS'（UTC）也转成 ISO，
+// 避免 'T' 与空格混比的字符串错位。
+const HOUR_AGO = "strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 hour')";
+function isoTime(col) {
+  return "strftime('%Y-%m-%dT%H:%M:%fZ'," + col + ")";
+}
+
 let schemaReady = false;
 async function ensureOAuthTables(env) {
   if (schemaReady) return;
@@ -77,7 +84,8 @@ async function ensureOAuthTables(env) {
   try { await env.DB.prepare("ALTER TABLE invite_codes ADD COLUMN code TEXT").run(); } catch {}
   // 一个邮箱只分配给一个申请（含已吊销）；已有重复数据时建索引会失败，不阻塞其它功能
   try { await env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_provision_requests_email ON provision_requests(email) WHERE email IS NOT NULL").run(); } catch {}
-  // 懒清理：过期 code / token
+  // 懒清理：过期 code / token；用过或过期的邀请码不留明文
+  try { await env.DB.prepare(`UPDATE invite_codes SET code=NULL WHERE code IS NOT NULL AND (used_at IS NOT NULL OR ${isoTime("created_at")} <= ${HOUR_AGO})`).run(); } catch {}
   try { await env.DB.prepare("DELETE FROM gw_oauth_codes WHERE expires_at < ?").bind(Date.now()).run(); } catch {}
   try { await env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE created_at < ?").bind(Date.now() - 365 * 24 * 3600 * 1000).run(); } catch {}
   schemaReady = true;
@@ -362,7 +370,6 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
 
     // ---- Provision：新 agent 申请身份（需人工审核） ----
 
-    // 提交申请（限流：同一 IP 1 小时最多 3 次）
     // 申请说明（agent 自助读取）
     if (path === "/provision/info" && request.method === "GET") {
       return Response.json({
@@ -387,39 +394,44 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       await ensureOAuthTables(env);
       let body;
       try { body = await request.json(); } catch { body = {}; }
+      if (!body || typeof body !== "object") body = {};
       // 邀请码必填，一次性
-      const inviteCode = (body.invite_code || "").trim();
+      const inviteCode = (typeof body.invite_code === "string" ? body.invite_code : "").trim();
       if (!inviteCode) {
         return Response.json({ error: "invite_code_required", message: "需要邀请码才能申请" }, { status: 400 });
       }
       const codeHash = await sha256hex(inviteCode);
-      const codeRow = await env.DB.prepare("SELECT code_hash, used_at, created_at FROM invite_codes WHERE code_hash=?").bind(codeHash).first();
+      const id = newId("prov");
+      const requestedEmail = (typeof body.requested_email === "string" ? body.requested_email : "").trim().toLowerCase().slice(0, 254) || null;
+      const text = (v) => (v == null ? null : String(v).slice(0, 2000));
+      // 先原子占用邀请码（未用、1 小时内、全局最近 1 小时申请不足 10 个），占用成功才插入申请。
+      // 两条语句在同一事务里；插入以 used_by=本次 id 为条件。
+      const [claim] = await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE invite_codes SET used_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), used_by=?, code=NULL
+           WHERE code_hash=? AND used_at IS NULL AND ${isoTime("created_at")} > ${HOUR_AGO}
+             AND (SELECT COUNT(*) FROM provision_requests WHERE ${isoTime("created_at")} > ${HOUR_AGO}) < 10`
+        ).bind(id, codeHash),
+        env.DB.prepare(
+          "INSERT INTO provision_requests (id, agent_name, reason, requested_email, status) SELECT ?, ?, ?, ?, 'pending' FROM invite_codes WHERE code_hash=? AND used_by=?"
+        ).bind(id, text(body.agent_name), text(body.reason), requestedEmail, codeHash, id),
+      ]);
+      if (claim.meta.changes === 1) {
+        return Response.json({ id, status: "pending", message: "等待人工审核" });
+      }
+      const codeRow = await env.DB.prepare(
+        `SELECT used_at, ${isoTime("created_at")} > ${HOUR_AGO} AS fresh FROM invite_codes WHERE code_hash=?`
+      ).bind(codeHash).first();
       if (!codeRow) {
         return Response.json({ error: "invalid_invite_code" }, { status: 403 });
       }
       if (codeRow.used_at) {
         return Response.json({ error: "invite_code_used" }, { status: 403 });
       }
-      // 1小时有效期
-      const createdMs = new Date(codeRow.created_at).getTime();
-      if (Date.now() - createdMs > 3600 * 1000) {
+      if (!codeRow.fresh) {
         return Response.json({ error: "invite_code_expired", message: "邀请码已过期（1小时有效）" }, { status: 403 });
       }
-      // 简单限流：最近1小时最多10个申请
-      const recent = await env.DB.prepare(
-        "SELECT COUNT(*) as c FROM provision_requests WHERE created_at > datetime('now','-1 hour')"
-      ).first();
-      if (recent && recent.c >= 10) {
-        return Response.json({ error: "rate_limited" }, { status: 429 });
-      }
-      const id = newId("prov");
-      const requestedEmail = (body.requested_email || "").trim().toLowerCase() || null;
-      await env.DB.prepare(
-        "INSERT INTO provision_requests (id, agent_name, reason, requested_email, status) VALUES (?,?,?,?,?)"
-      ).bind(id, body.agent_name || null, body.reason || null, requestedEmail, "pending").run();
-      // 标记邀请码已用
-      await env.DB.prepare("UPDATE invite_codes SET used_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), used_by=? WHERE code_hash=?").bind(id, codeHash).run();
-      return Response.json({ id, status: "pending", message: "等待人工审核" });
+      return Response.json({ error: "rate_limited" }, { status: 429 });
     }
 
     // 查申请状态
@@ -445,7 +457,7 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       ).all();
       // 有效邀请码（未使用、1小时内、有明文）
       const codes = await env.DB.prepare(
-        "SELECT code, created_at FROM invite_codes WHERE used_at IS NULL AND code IS NOT NULL AND created_at > datetime('now','-1 hour') ORDER BY created_at DESC"
+        `SELECT code, created_at FROM invite_codes WHERE used_at IS NULL AND code IS NOT NULL AND ${isoTime("created_at")} > ${HOUR_AGO} ORDER BY created_at DESC`
       ).all();
       const codeItems = (codes.results || []).map((c, i) =>
         `<div style="display:flex;align-items:center;gap:8px;margin:4px 0">

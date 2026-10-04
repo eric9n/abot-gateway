@@ -520,6 +520,82 @@ try {
     if (q1("SELECT COUNT(*) c FROM provision_requests WHERE email='same@abot.run'").c !== 1) fail('失败的一方应整体回滚');
   }
   console.log('   ✓ 邮箱校验正确');
+
+  console.log('11e. 邀请码一次性（并发）、过期、错误码与 mail 服务契约...');
+  {
+    const iso = (minAgo) => new Date(Date.now() - minAgo * 60000).toISOString();
+    const legacy = (minAgo) => iso(minAgo).replace('T', ' ').slice(0, 19);
+    const addCode = async (code, createdAt) => {
+      const h = Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(code))).toString('hex');
+      D1.raw.prepare('INSERT INTO invite_codes (code_hash, code, created_at) VALUES (?,?,?)').run(h, code, createdAt);
+    };
+    ageRequests();
+    const before = q1('SELECT COUNT(*) c FROM provision_requests').c;
+    const code = await newCode();
+    const rs = await Promise.all([1, 2, 3, 4].map(() => signup(code).then(async (r) => ({ status: r.status, body: await r.json() }))));
+    const won = rs.filter((r) => r.status === 200);
+    if (won.length !== 1) fail('同一邀请码并发只能成功一次: ' + JSON.stringify(rs));
+    const w = won[0].body;
+    if (!w.id || w.status !== 'pending' || !w.message || Object.keys(w).sort().join() !== 'id,message,status') fail('成功响应应为 {id,status:pending,message}: ' + JSON.stringify(w));
+    if (rs.filter((r) => r.status === 403 && r.body.error === 'invite_code_used').length !== 3) fail('其余并发请求应 invite_code_used: ' + JSON.stringify(rs));
+    if (q1('SELECT COUNT(*) c FROM provision_requests').c !== before + 1) fail('并发后只应多一条申请');
+    if (q1('SELECT COUNT(*) c FROM invite_codes WHERE used_at IS NOT NULL AND code IS NOT NULL').c !== 0) fail('用过的邀请码不应保留明文');
+
+    const expect = async (c, status, error, label) => {
+      ageRequests();
+      const r = await signup(c);
+      const b = await r.json();
+      if (r.status !== status || (error && b.error !== error)) fail(label + ': 期望 ' + status + ' ' + error + '，实际 ' + r.status + ' ' + JSON.stringify(b));
+      return b;
+    };
+    await expect('', 400, 'invite_code_required', '缺邀请码');
+    await expect('inv_nope', 403, 'invalid_invite_code', '不存在的邀请码');
+    await addCode('inv_expired_iso', iso(61));
+    await expect('inv_expired_iso', 403, 'invite_code_expired', '61 分钟前的邀请码');
+    await addCode('inv_legacy_fresh', legacy(30));
+    await expect('inv_legacy_fresh', 200, null, '老格式 30 分钟前的邀请码（按 UTC）');
+    await addCode('inv_legacy_old', legacy(90));
+    await expect('inv_legacy_old', 403, 'invite_code_expired', '老格式 90 分钟前的邀请码');
+    const noBody = await call('https://abot-gateway/provision/request', { method: 'POST', body: 'not json' });
+    if (noBody.status !== 400 || (await noBody.json()).error !== 'invite_code_required') fail('非 JSON 应按缺邀请码处理');
+  }
+  console.log('   ✓ 邀请码行为正确');
+
+  console.log('11f. 限流只统计最近 1 小时（ISO 时间比较）...');
+  {
+    ageRequests();
+    const ins = D1.raw.prepare("INSERT INTO provision_requests (id, status, created_at) VALUES (?, 'denied', ?)");
+    // 同一天、早于 1 小时的旧行（旧代码用 datetime() 空格格式比较会误计入）
+    for (let i = 0; i < 20; i++) ins.run('old_' + i, new Date(Date.now() - (61 + i) * 60000).toISOString());
+    for (let i = 0; i < 9; i++) ins.run('new_' + i, new Date(Date.now() - (5 + i) * 60000).toISOString());
+    const okCode = await newCode();
+    const r1 = await signup(okCode);
+    if (r1.status !== 200) fail('窗口内 9 条时第 10 条应放行，实际 ' + r1.status + ' ' + await r1.text());
+    const limited = await newCode();
+    const r2 = await signup(limited);
+    if (r2.status !== 429 || (await r2.json()).error !== 'rate_limited') fail('窗口内满 10 条应 429');
+    if (q1("SELECT used_at FROM invite_codes WHERE code=?", limited)?.used_at !== null) fail('被限流时邀请码不应作废');
+    ageRequests();
+    if ((await signup(limited)).status !== 200) fail('窗口过去后同一邀请码应仍可用');
+  }
+  console.log('   ✓ 限流窗口正确');
+
+  console.log('11g. admin 页只列未过期、未使用的邀请码...');
+  {
+    const h = async (c) => Buffer.from(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(c))).toString('hex');
+    D1.raw.prepare('INSERT INTO invite_codes (code_hash, code, created_at) VALUES (?,?,?)').run(await h('inv_list_stale'), 'inv_list_stale', new Date(Date.now() - 2 * 3600000).toISOString());
+    // 今天 00:00Z 的码在当天 01:00Z 之后已过期；旧代码的字符串比较会把它当成有效
+    D1.raw.prepare("INSERT INTO invite_codes (code_hash, code, created_at) VALUES (?, 'inv_list_midnight', strftime('%Y-%m-%dT00:00:00.000Z','now','-1 hour'))").run(await h('inv_list_midnight'));
+    const fresh = await newCode();
+    const used = await newCode();
+    ageRequests();
+    await signup(used);
+    const html = await (await adminGet()).text();
+    if (!html.includes(fresh)) fail('有效邀请码应列出');
+    if (html.includes('inv_list_stale') || html.includes('inv_list_midnight')) fail('过期邀请码不应列出');
+    if (html.includes(used)) fail('已用邀请码不应列出');
+  }
+  console.log('   ✓ 邀请码列表正确');
 } finally {
   globalThis.fetch = savedFetch;
 }
