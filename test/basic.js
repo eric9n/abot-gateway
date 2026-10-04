@@ -771,6 +771,13 @@ try {
     if (JSON.stringify(info).includes('mail.abot.run')) fail('申请说明 JSON 不应再指向 mail.abot.run');
     const legacy = await (await call('https://abot.run/provision/info')).json();
     if (JSON.stringify(legacy) !== JSON.stringify(info)) fail('/provision/info 应与 /signup JSON 一致');
+    const root = await call('https://abot.run/');
+    if (root.status !== 200 || JSON.stringify(await root.json()) !== JSON.stringify(info)) fail('GET abot.run/ 应返回 /signup 的 JSON');
+    const rootHtml = await (await call('https://abot.run/', { headers: { Accept: 'text/html' } })).text();
+    if (rootHtml !== htmlText) fail('GET abot.run/ 带 Accept: text/html 应返回 /signup 的 HTML');
+    const adminRoot = await call(ADMIN + '/', { headers: { Accept: 'text/html' } });
+    if (adminRoot.status !== 403) fail('admin.abot.run/ 仍应是需要 Access 的管理页，实际 ' + adminRoot.status);
+    if ((await call('https://abot.run/', { method: 'POST' })).status !== 401) fail('POST abot.run/ 不应返回申请说明');
 
     const post = (path, code, extra = {}) => call('https://abot.run' + path, {
       method: 'POST',
