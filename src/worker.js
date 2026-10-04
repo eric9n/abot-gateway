@@ -115,9 +115,10 @@ const SIGNUP_INFO = {
     "向你的主人要一个邀请码（一小时有效，一次性）",
     "想一个你想要的邮箱地址，必须是 xxx@abot.run 格式",
     "POST https://abot.run/signup 提交申请",
-    "提交后等待主人审核，通过后主人会把 secret 发给你",
-    "用邮箱 + secret 调 POST https://abot.run/oauth/token (grant_type=password) 换取 access_token",
-    "以后调 https://abot.run/mcp 时带 Authorization: Bearer <access_token>",
+    "提交后拿到申请 id，可用 GET https://abot.run/provision/status?id=<申请 id> 查进度",
+    "审核通过后，主人会把邮箱和 secret（ask_...）发给你",
+    "用邮箱 + secret 换 access_token：POST https://abot.run/oauth/token，表单格式（application/x-www-form-urlencoded，不是 JSON），字段 grant_type=password、username=<邮箱>、password=<secret>",
+    "以后调 POST https://abot.run/mcp 时带 Authorization: Bearer <access_token>",
   ],
   request_format: {
     invite_code: "inv_...（必填，主人给的）",
@@ -127,6 +128,19 @@ const SIGNUP_INFO = {
   },
   apply_url: "https://abot.run/signup",
   status_url: "https://abot.run/provision/status?id=<申请 id>",
+  token: {
+    url: "https://abot.run/oauth/token",
+    content_type: "application/x-www-form-urlencoded",
+    example: "curl -X POST https://abot.run/oauth/token -d grant_type=password -d username=mybot@abot.run -d password=ask_...",
+    response: '{"access_token":"abot_...","token_type":"Bearer","email":"mybot@abot.run"}',
+  },
+  mcp: {
+    url: "https://abot.run/mcp",
+    transport: "POST JSON-RPC 2.0，响应为普通 JSON（不支持 GET / SSE）",
+    auth: "Authorization: Bearer <access_token>；标准 MCP 客户端也可以只配置这个 URL，通过 /.well-known/oauth-protected-resource 自动走 OAuth 授权码流程，在授权页填邮箱和 secret",
+    methods: ["initialize", "tools/list", "tools/call"],
+    tool_names: "工具名带服务前缀，如 mail_send、data_query；先调 tools/list 查看",
+  },
 };
 
 // 页面只含 SIGNUP_INFO 的静态文本；仍要 esc()，否则 "<access_token>" 会被浏览器当成标签吞掉
@@ -139,7 +153,9 @@ code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5
 </head><body><h2>aBot 邮箱申请</h2>
 <ol>${SIGNUP_INFO.steps.map((s) => `<li>${esc(s)}</li>`).join("")}</ol>
 <h3>申请格式</h3><pre>${esc(JSON.stringify(SIGNUP_INFO.request_format, null, 2))}</pre>
-<p>提交地址：<code>POST ${esc(SIGNUP_INFO.apply_url)}</code></p></body></html>`;
+<p>提交地址：<code>POST ${esc(SIGNUP_INFO.apply_url)}</code></p>
+<h3>换 access_token</h3><pre>${esc(JSON.stringify(SIGNUP_INFO.token, null, 2))}</pre>
+<h3>连接 MCP</h3><pre>${esc(JSON.stringify(SIGNUP_INFO.mcp, null, 2))}</pre></body></html>`;
   return new Response(html, {
     headers: {
       "content-type": "text/html; charset=utf-8",
@@ -512,7 +528,13 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
     // Token 交换
     if (path === "/oauth/token" && request.method === "POST") {
       await ensureOAuthTables(env);
-      const form = await request.formData();
+      let form;
+      try { form = await request.formData(); } catch {
+        return Response.json({
+          error: "invalid_request",
+          message: "请用表单格式（application/x-www-form-urlencoded）提交，不是 JSON。字段：grant_type=password、username=<邮箱>、password=<secret>",
+        }, { status: 400 });
+      }
       const grantType = form.get("grant_type");
       // password grant：邮箱+secret 换 token（给 agent 用）
       if (grantType === "password") {
