@@ -340,6 +340,110 @@ console.log('10. Admin Access JWT 校验 AUD tag...');
 }
 console.log('   ✓ Access AUD tag 校验正确');
 
+console.log('11. 行为测试：node:sqlite 模拟 D1，跑构建后的 dist/worker.js...');
+const { sqliteD1, accessKeys, ADMIN } = await import('./harness.js');
+execSync('node build.js', { stdio: 'pipe' });
+const built = (await import('../dist/worker.js?behavior=' + Date.now())).default;
+const D1 = sqliteD1();
+const env = { DB: D1 };
+const ak = await accessKeys();
+const J = await ak.sign(ak.claims());
+const savedFetch = globalThis.fetch;
+globalThis.fetch = ak.fetchMock;
+
+const call = (url, init = {}) => built.fetch(new Request(url, init), env);
+const q1 = (sql, ...args) => D1.raw.prepare(sql).get(...args);
+function adminPost(path, body, opts = {}) {
+  const headers = { 'Content-Type': 'application/json', Origin: ADMIN, ...(opts.headers || {}) };
+  if (opts.jwt !== null) headers['Cf-Access-Jwt-Assertion'] = opts.jwt || J;
+  for (const k of Object.keys(headers)) if (headers[k] === null) delete headers[k];
+  return call((opts.host || ADMIN) + path, { method: 'POST', headers, body: typeof body === 'string' ? body : JSON.stringify(body) });
+}
+const adminGet = (opts = {}) => call((opts.host || ADMIN) + (opts.path || '/'), { headers: { 'Cf-Access-Jwt-Assertion': opts.jwt || J } });
+// 与 mail.abot.run 的 service binding 调用一致：host 为 abot-gateway，无 Origin
+const signup = (code, extra = {}) => call('https://abot-gateway/provision/request', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ invite_code: code, agent_name: 'bot', reason: 'test', ...extra }),
+});
+const newCode = async () => (await (await adminPost('/invite', {})).json()).code;
+const newRequest = async () => (await (await signup(await newCode())).json()).id;
+async function approveNew(email) {
+  const id = await newRequest();
+  const r = await adminPost('/approve', { id, email });
+  return { id, status: r.status, body: await r.json() };
+}
+function passwordGrant(email, secret) {
+  const fd = new FormData();
+  fd.set('grant_type', 'password');
+  fd.set('username', email);
+  fd.set('password', secret);
+  return call('https://abot.run/oauth/token', { method: 'POST', body: fd });
+}
+const client = await (await call('https://abot.run/oauth/register', {
+  method: 'POST', body: JSON.stringify({ redirect_uris: ['https://client.example/cb'] }),
+})).json();
+function authorize(email, secret) {
+  const fd = new FormData();
+  fd.set('email', email);
+  fd.set('secret', secret);
+  const qs = new URLSearchParams({ client_id: client.client_id, redirect_uri: 'https://client.example/cb' });
+  return call('https://abot.run/oauth/authorize?' + qs, { method: 'POST', body: fd });
+}
+const mcpInit = (token) => call('https://abot.run/mcp', {
+  method: 'POST',
+  headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+  body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize' }),
+});
+
+try {
+  console.log('11a. 吊销后旧 secret 不能再换 token / 授权...');
+  {
+    const { id, body: ap } = await approveNew('revokeme@abot.run');
+    if (!ap.ok || !ap.secret) fail('approve 应返回 secret: ' + JSON.stringify(ap));
+    const g = await passwordGrant('revokeme@abot.run', ap.secret);
+    if (g.status !== 200) fail('吊销前 password grant 应成功，实际 ' + g.status);
+    const { access_token } = await g.json();
+    if ((await mcpInit(access_token)).status !== 200) fail('吊销前 token 应可用');
+    const a = await authorize('revokeme@abot.run', ap.secret);
+    if (a.status !== 302) fail('吊销前 authorize 应 302，实际 ' + a.status);
+    if (q1("SELECT COUNT(*) c FROM gw_oauth_codes WHERE email='revokeme@abot.run'").c !== 1) fail('应有一个未用的授权码');
+
+    const rv = await adminPost('/revoke', { id });
+    if (rv.status !== 200) fail('吊销应成功，实际 ' + rv.status);
+    const row = q1('SELECT status, secret_hash FROM provision_requests WHERE id=?', id);
+    if (row.status !== 'revoked' || row.secret_hash !== null) fail('吊销后应 status=revoked 且清空 secret_hash: ' + JSON.stringify(row));
+    if ((await passwordGrant('revokeme@abot.run', ap.secret)).status !== 401) fail('吊销后 password grant 必须失败');
+    if ((await authorize('revokeme@abot.run', ap.secret)).status !== 401) fail('吊销后 authorize 必须失败');
+    if ((await mcpInit(access_token)).status !== 401) fail('吊销后旧 bearer token 必须失效');
+    if (q1("SELECT COUNT(*) c FROM gw_oauth_codes WHERE email='revokeme@abot.run'").c !== 0) fail('吊销应删除未用授权码');
+    if ((await adminPost('/rotate', { id })).status !== 404) fail('已吊销的申请不能换 Secret');
+    const again = await adminPost('/revoke', { id });
+    if (again.status !== 409) fail('重复吊销应 409，实际 ' + again.status);
+
+    const html = await (await adminGet()).text();
+    const agentsBlock = html.slice(html.indexOf('已接入 Agent'), html.indexOf('</div>\n', html.indexOf('已接入 Agent')) + 1);
+    if (agentsBlock.includes('revokeme@abot.run')) fail('已吊销的 agent 不应列在「已接入」');
+    if (!html.includes('已吊销')) fail('申请列表应标注已吊销');
+  }
+  console.log('   ✓ 吊销覆盖 password grant、authorize、bearer token、授权码');
+
+  console.log('11b. 换 Secret 后旧 secret 失效、新 secret 可用...');
+  {
+    const { id, body: ap } = await approveNew('rotate@abot.run');
+    await authorize('rotate@abot.run', ap.secret);
+    const rt = await (await adminPost('/rotate', { id })).json();
+    if (!rt.ok || !rt.secret || rt.secret === ap.secret) fail('rotate 应返回新 secret');
+    if ((await passwordGrant('rotate@abot.run', ap.secret)).status !== 401) fail('换 Secret 后旧 secret 必须失效');
+    if ((await passwordGrant('rotate@abot.run', rt.secret)).status !== 200) fail('换 Secret 后新 secret 应可用');
+    if (q1("SELECT COUNT(*) c FROM gw_oauth_codes WHERE email='rotate@abot.run'").c !== 0) fail('换 Secret 应删除未用授权码');
+    if (q1("SELECT COUNT(*) c FROM agent_tokens WHERE email='rotate@abot.run' AND revoked_at IS NULL").c !== 1) fail('换 Secret 后只应有一个有效 token');
+  }
+  console.log('   ✓ 换 Secret 行为正确');
+} finally {
+  globalThis.fetch = savedFetch;
+}
+
 console.log('检查 install-skills.sh 的仓库地址...');
 execSync('bash test/install-skills-urls.sh', { stdio: 'inherit' });
 

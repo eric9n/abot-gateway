@@ -37,6 +37,8 @@ function esc(s) {
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
+const STATUS_LABELS = { pending: "待审核", approved: "已通过", denied: "已拒绝", revoked: "已吊销" };
+
 // 通用 500（不泄漏内部细节）
 function internalError() {
   return Response.json({ ok: false, error: "internal_error" }, { status: 500 });
@@ -300,9 +302,10 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
           return Response.json({ error: "invalid_request" }, { status: 400 });
         }
         const hash = await sha256hex(password);
+        // 与 /oauth/authorize 同一凭证来源：吊销或换 Secret 后旧 secret 立即失效
         const row = await env.DB.prepare(
-          "SELECT email FROM provision_requests WHERE email=? AND secret_hash=? AND status='approved'"
-        ).bind(username, hash).first();
+          "SELECT email FROM agent_tokens WHERE token_hash=? AND email=? AND revoked_at IS NULL"
+        ).bind(hash, username).first();
         if (!row) {
           return Response.json({ error: "invalid_grant", message: "邮箱或 secret 不正确" }, { status: 401 });
         }
@@ -451,8 +454,9 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
         `<div style="border:1px solid #ddd;border-radius:8px;padding:12px;margin:8px 0">
           <b>${esc(r.agent_name) || "(未命名)"}</b> <span style="color:#666">${esc(r.id)}</span><br>
           <span>${esc(r.reason)}</span><br>
-          <span>状态: ${esc(r.status)}</span> <span style="color:#999">${esc(r.created_at)}</span><br>
+          <span>状态: ${esc(STATUS_LABELS[r.status] || r.status)}</span> <span style="color:#999">${esc(r.created_at)}</span><br>
           ${r.status === "approved" && r.email ? `<span style="color:#2e7d32">邮箱: ${esc(r.email)}</span><br>` : ""}
+          ${r.status === "revoked" && r.email ? `<span style="color:#c62828">邮箱: ${esc(r.email)}（已吊销）</span><br>` : ""}
           ${r.status === "pending" ? `
             <div class="req-row" style="margin-top:8px">
               ${r.requested_email ? `<span style="color:#666">申请想要：${esc(r.requested_email)}</span><br>` : ""}
@@ -488,7 +492,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
     const invitePath = isAdminHost2 ? "/invite" : "/admin/invite";
     const rotatePath = isAdminHost2 ? "/rotate" : "/admin/rotate";
     const revokePath = isAdminHost2 ? "/revoke" : "/admin/revoke";
-    // 吊销：该邮箱所有 token 失效
+    // 吊销：申请标记 revoked，secret / token / 授权码全部失效
     if (path === revokePath && request.method === "POST") {
       const denied = await requireAccess(request);
         if (denied) return denied;
@@ -496,15 +500,21 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
         await ensureOAuthTables(env);
         const body = await request.json();
         const id = body.id || "";
-        const req = await env.DB.prepare("SELECT email FROM provision_requests WHERE id=?").bind(id).first();
-        if (req && req.email) {
-          await env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=?").bind(req.email).run();
-          await env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email).run();
+        const req = await env.DB.prepare("SELECT email, status FROM provision_requests WHERE id=?").bind(id).first();
+        if (!req || !req.email) return Response.json({ ok: false, error: "not_found" }, { status: 404 });
+        if (req.status !== "approved") {
+          return Response.json({ ok: false, error: "not_approved", message: "该申请当前不是已通过状态" }, { status: 409 });
         }
+        await env.DB.batch([
+          env.DB.prepare("UPDATE provision_requests SET status='revoked', secret_hash=NULL WHERE id=?").bind(id),
+          env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=? AND revoked_at IS NULL").bind(req.email),
+          env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email),
+          env.DB.prepare("DELETE FROM gw_oauth_codes WHERE email=?").bind(req.email),
+        ]);
         return Response.json({ ok: true });
       } catch (e) { return internalError(); }
     }
-    // 换 Secret：生成新的 ask_，旧的失效
+    // 换 Secret：生成新的 ask_，旧的失效（仅限 approved）
     if (path === rotatePath && request.method === "POST") {
       const denied = await requireAccess(request);
         if (denied) return denied;
@@ -516,10 +526,17 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
         if (!req || !req.email) return Response.json({ ok: false, error: "not_found" }, { status: 404 });
         const secret = "ask_" + [...crypto.getRandomValues(new Uint8Array(18))].map(b => b.toString(16).padStart(2, "0")).join("");
         const secretHash = await sha256hex(secret);
-        await env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=?").bind(req.email).run();
-        await env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email).run();
-        await env.DB.prepare("UPDATE provision_requests SET secret_hash=? WHERE id=?").bind(secretHash, id).run();
-        await env.DB.prepare("INSERT INTO agent_tokens (token_hash, email, request_id) VALUES (?,?,?)").bind(secretHash, req.email, id).run();
+        // 新 token 只在申请仍为 approved 时写入，避免与并发吊销交错后复活凭证
+        const results = await env.DB.batch([
+          env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=? AND revoked_at IS NULL").bind(req.email),
+          env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email),
+          env.DB.prepare("DELETE FROM gw_oauth_codes WHERE email=?").bind(req.email),
+          env.DB.prepare("UPDATE provision_requests SET secret_hash=? WHERE id=? AND status='approved'").bind(secretHash, id),
+          env.DB.prepare("INSERT INTO agent_tokens (token_hash, email, request_id) SELECT ?, email, id FROM provision_requests WHERE id=? AND status='approved' AND email=?").bind(secretHash, id, req.email),
+        ]);
+        if (!results[4] || !results[4].meta || results[4].meta.changes !== 1) {
+          return Response.json({ ok: false, error: "not_approved", message: "该申请已不是已通过状态" }, { status: 409 });
+        }
         return Response.json({ ok: true, email: req.email, secret });
       } catch (e) { return internalError(); }
     }
