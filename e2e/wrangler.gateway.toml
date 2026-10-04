@@ -1,5 +1,5 @@
 # 仅供本地 e2e（wrangler dev）。不要用本文件 wrangler deploy。
-# CI 部署读的是仓库根目录的 wrangler.toml，不会用到这个文件。
+# CI 部署读的是仓库根目录的 wrangler.toml（生产配置），不会用到这个文件。
 # service 名与线上 Worker 脚本名一致；本地进程是 e2e/mock-backend.js，不是真实后端。
 name = "abot-gateway"
 main = "../src/worker.js"
