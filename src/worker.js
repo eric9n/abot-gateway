@@ -567,8 +567,9 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
 
     // ---- Provision：新 agent 申请身份（需人工审核） ----
 
-    // 申请说明（agent 自助读取；浏览器访问返回 HTML）
-    if ((path === "/signup" || path === "/provision/info") && request.method === "GET") {
+    // 申请说明（agent 自助读取；浏览器访问返回 HTML）。admin.abot.run 的 / 是管理页，不在这里处理
+    const isSignupInfo = path === "/signup" || path === "/provision/info" || (path === "/" && url.hostname !== ADMIN_HOST);
+    if (isSignupInfo && request.method === "GET") {
       return signupPage(request);
     }
 
