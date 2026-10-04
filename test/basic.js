@@ -91,7 +91,7 @@ for (const [s, name] of bad) {
 console.log('   ✓ 无危险模式');
 
 console.log('7. 检查 Service Binding...');
-const bindings = ['BACKEND_DATA', 'BACKEND_MAIL', 'BACKEND_HEALTH', 'BACKEND_RULES', 'BACKEND_SECRETS'];
+const bindings = ['BACKEND_DATA', 'BACKEND_MAIL', 'BACKEND_HEALTH', 'BACKEND_RULES', 'BACKEND_SECRETS', 'BACKEND_SMS'];
 for (const name of bindings) {
   if (!workerSrc.includes(name)) { console.error(`   ✗ 缺少 binding ${name}`); process.exit(1); }
 }
