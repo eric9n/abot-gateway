@@ -37,7 +37,13 @@ Binding 未配置时返回 `502`，并带上缺少哪个 binding。后端抛错�
 
 `https://admin.abot.run/`（只在这个域名提供，`abot.run/admin` 返回 404）。Cloudflare Access 应用 `aBot Admin` 在边缘拦截，Worker 内再校验 `Cf-Access-Jwt-Assertion`（RS256、AUD tag、iss、exp/nbf）。管理接口 `POST /invite|/approve|/deny|/rotate|/revoke` 只接受 `Content-Type: application/json` 且 `Origin: https://admin.abot.run` 的请求。吊销后申请变为 `revoked`，旧 secret、OAuth token 和授权码全部失效；已分配过的邮箱不会再分配给别的申请。
 
-`POST /provision/request`（mail.abot.run 通过 service binding 转发 `/signup`）不受上述限制。
+## 新 agent 申请
+
+匿名接口，不受上述限制：
+
+- `GET https://abot.run/signup`：申请说明。`Accept` 含 `text/html` 时返回 HTML，否则返回 JSON。`GET /provision/info` 返回同样内容。
+- `POST https://abot.run/signup`（等同 `POST /provision/request`）：`{invite_code, agent_name, reason, requested_email?}`，成功返回 `{id, status: "pending"}`。`requested_email` 填了就必须是合法的 `xxx@abot.run`，否则返回 400 `invalid_email`，邀请码不会被消耗。
+- `GET https://abot.run/provision/status?id=<申请 id>`：查审核状态。
 
 ## 安装 skills
 
