@@ -113,6 +113,8 @@ async function sha256hex(s) {
 const ACCESS_TEAM = "boliam.cloudflareaccess.com";
 // aBot Admin（admin.abot.run）的 AUD tag。JWT 的 aud 是这个值，不是应用 UUID。
 const ACCESS_AUD = "20d26cf162fe474df036d3de12e12f893893bd7b031a4b03ec50ce3e4cdbaf99";
+const ACCESS_ISS = "https://" + ACCESS_TEAM;
+const JWT_SKEW_SEC = 60;
 let jwksCache = null;
 let jwksCacheAt = 0;
 
@@ -125,8 +127,12 @@ function b64urlToBytes(s) {
   return out;
 }
 
-async function getAccessJwks() {
-  if (jwksCache && Date.now() - jwksCacheAt < 10 * 60 * 1000) return jwksCache;
+// force=true 时跳过缓存（遇到未知 kid 说明 Access 可能轮换了密钥）。强制刷新至少间隔 30 秒，防止被伪造 kid 刷爆。
+let jwksForcedAt = 0;
+async function getAccessJwks(force) {
+  if (!force && jwksCache && Date.now() - jwksCacheAt < 10 * 60 * 1000) return jwksCache;
+  if (force && jwksCache && Date.now() - jwksForcedAt < 30 * 1000) return jwksCache;
+  if (force) jwksForcedAt = Date.now();
   const r = await fetch("https://" + ACCESS_TEAM + "/cdn-cgi/access/certs");
   if (!r.ok) throw new Error("jwks fetch failed");
   jwksCache = await r.json();
@@ -145,12 +151,18 @@ async function requireAccess(request) {
     if (parts.length !== 3) throw new Error("bad jwt");
     const header = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[0])));
     const payload = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[1])));
-    if (payload.exp * 1000 < Date.now()) throw new Error("expired");
+    if (header.alg !== "RS256") throw new Error("bad alg");
+    const now = Date.now() / 1000;
+    if (typeof payload.exp !== "number" || payload.exp + JWT_SKEW_SEC < now) throw new Error("expired");
+    if (payload.nbf !== undefined && (typeof payload.nbf !== "number" || payload.nbf - JWT_SKEW_SEC > now)) throw new Error("not yet valid");
+    if (payload.iss !== ACCESS_ISS) throw new Error("bad iss");
     const aud = payload.aud;
     const audOk = Array.isArray(aud) ? aud.includes(ACCESS_AUD) : aud === ACCESS_AUD;
     if (!audOk) throw new Error("bad aud");
-    const jwks = await getAccessJwks();
-    const jwk = (jwks.keys || []).find((k) => k.kid === header.kid);
+    if (typeof header.kid !== "string" || !header.kid) throw new Error("no kid");
+    const findKey = (jwks) => (jwks.keys || []).find((k) => k.kid === header.kid);
+    let jwk = findKey(await getAccessJwks(false));
+    if (!jwk) jwk = findKey(await getAccessJwks(true));
     if (!jwk) throw new Error("unknown kid");
     const key = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
     const data = new TextEncoder().encode(parts[0] + "." + parts[1]);

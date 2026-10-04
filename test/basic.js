@@ -341,7 +341,7 @@ console.log('10. Admin Access JWT 校验 AUD tag...');
 console.log('   ✓ Access AUD tag 校验正确');
 
 console.log('11. 行为测试：node:sqlite 模拟 D1，跑构建后的 dist/worker.js...');
-const { sqliteD1, accessKeys, ADMIN } = await import('./harness.js');
+const { sqliteD1, accessKeys, ADMIN, AUD: AUD_TAG } = await import('./harness.js');
 execSync('node build.js', { stdio: 'pipe' });
 const built = (await import('../dist/worker.js?behavior=' + Date.now())).default;
 const D1 = sqliteD1();
@@ -693,6 +693,47 @@ try {
     if (pp.status !== 500 || ppt.includes('secret detail')) fail('admin POST 出错应返回通用 500: ' + pp.status + ' ' + ppt);
   }
   console.log('   ✓ admin 页安全头与异常处理正确');
+
+  console.log('11k. Access JWT：exp/nbf/iss/alg 与未知 kid 刷新...');
+  {
+    const now = Math.floor(Date.now() / 1000);
+    const status = async (jwt) => (await adminGet({ jwt })).status;
+    const cases = [
+      ['缺 exp', ak.claims({ exp: undefined }), 403],
+      ['exp 为字符串', ak.claims({ exp: String(now + 3600) }), 403],
+      ['过期 2 分钟', ak.claims({ exp: now - 120 }), 403],
+      ['过期 30 秒（容差内）', ak.claims({ exp: now - 30 }), 200],
+      ['nbf 在 5 分钟后', ak.claims({ nbf: now + 300 }), 403],
+      ['nbf 在 30 秒后（容差内）', ak.claims({ nbf: now + 30 }), 200],
+      ['nbf 已过', ak.claims({ nbf: now - 10 }), 200],
+      ['iss 错误', ak.claims({ iss: 'https://evil.cloudflareaccess.com' }), 403],
+      ['缺 iss', ak.claims({ iss: undefined }), 403],
+      ['aud 为字符串', ak.claims({ aud: AUD_TAG }), 200],
+    ];
+    for (const [label, claims, want] of cases) {
+      const got = await status(await ak.sign(JSON.parse(JSON.stringify(claims))));
+      if (got !== want) fail('JWT ' + label + ': 期望 ' + want + '，实际 ' + got);
+    }
+    if (await status(await ak.sign(ak.claims(), { alg: 'HS256' })) !== 403) fail('header.alg 非 RS256 应拒绝');
+    if (await status(await ak.sign(ak.claims(), { alg: 'none' })) !== 403) fail('header.alg=none 应拒绝');
+    const tampered = J.split('.');
+    tampered[1] = Buffer.from(JSON.stringify(ak.claims({ email: 'attacker@example.com' }))).toString('base64url');
+    if (await status(tampered.join('.')) !== 403) fail('篡改 payload 应拒绝');
+    const missingExpPost = await adminPost('/invite', {}, { jwt: await ak.sign(JSON.parse(JSON.stringify(ak.claims({ exp: undefined })))) });
+    if (missingExpPost.status !== 403) fail('缺 exp 的 JWT 不能调用 admin POST');
+
+    // 密钥轮换：缓存里只有 k1，新 JWT 用 k2 → 绕过缓存重新拉一次 JWKS 后通过
+    ak.state.published = ['k1', 'k2'];
+    const before = ak.state.certFetches;
+    if (await status(await ak.sign(ak.claims(), { kid: 'k2' })) !== 200) fail('未知 kid 应刷新 JWKS 后通过');
+    if (ak.state.certFetches !== before + 1) fail('未知 kid 应只强制刷新一次 JWKS，实际 ' + (ak.state.certFetches - before));
+    if (await status(await ak.sign(ak.claims(), { kid: 'k2' })) !== 200) fail('刷新后的 kid 应命中缓存');
+    if (ak.state.certFetches !== before + 1) fail('命中缓存不应再拉 JWKS');
+    // 仍未知的 kid：30 秒内不再强制刷新，直接拒绝
+    if (await status(await ak.sign(ak.claims(), { kid: 'k3' })) !== 403) fail('JWKS 里没有的 kid 应拒绝');
+    if (ak.state.certFetches !== before + 1) fail('强制刷新应有间隔，防止伪造 kid 刷 JWKS');
+  }
+  console.log('   ✓ Access JWT 校验正确');
 } finally {
   globalThis.fetch = savedFetch;
 }

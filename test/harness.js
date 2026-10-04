@@ -63,7 +63,7 @@ async function newKey(kid) {
 }
 
 export async function accessKeys() {
-  const keys = { k1: await newKey('k1'), k2: await newKey('k2') };
+  const keys = { k1: await newKey('k1'), k2: await newKey('k2'), k3: await newKey('k3') };
   const state = { published: ['k1'], certFetches: 0 };
   async function sign(payload, opts = {}) {
     const key = keys[opts.kid || 'k1'];
