@@ -1,6 +1,6 @@
 # aBot Gateway
 
-统一 MCP 网关，聚合 mail/data/health/rules/secrets 五个后端服务。
+统一 MCP 网关，聚合 mail/data/health/rules/secrets/sms 六个后端服务。
 
 ## 开发
 
@@ -18,7 +18,7 @@ push 到 main 自动部署（需配置 GitHub Secrets）：
 
 网关用 Cloudflare Service Bindings 调用后端：`env.<BINDING>.fetch()`，不走公网，也不再读取或转发 `X-Internal-Token`。身份仍通过 `X-Abot-Owner-Email` 传递。
 
-部署前把下面 5 个 service binding 加进**现有** wrangler 配置（或 Dashboard → Worker → Bindings）。网关和这 5 个后端必须在同一个 Cloudflare 账号。`service` 是 Worker 脚本名。请与现有的 D1 binding `DB`、路由一起保留，不要用残缺配置覆盖线上 Worker。可复制的片段见 `wrangler.toml.example`（该文件不会被 CI 部署；CI 仍使用 `wrangler.toml`）。
+部署前把下面 6 个 service binding 加进**现有** wrangler 配置（或 Dashboard → Worker → Bindings）。网关和这 6 个后端必须在同一个 Cloudflare 账号。`service` 是 Worker 脚本名。请与现有的 D1 binding `DB`、路由一起保留，不要用残缺配置覆盖线上 Worker。可复制的片段见 `wrangler.toml.example`（该文件不会被 CI 部署；CI 仍使用 `wrangler.toml`）。
 
 | 路径前缀 | Binding | 后端 Worker |
 | --- | --- | --- |
@@ -27,6 +27,7 @@ push 到 main 自动部署（需配置 GitHub Secrets）：
 | `/health/` | `BACKEND_HEALTH` | `abot-health` |
 | `/rules/` | `BACKEND_RULES` | `abot-rules` |
 | `/secrets/` | `BACKEND_SECRETS` | `abot-secrets` |
+| `/sms/` | `BACKEND_SMS` | `abot-sms` |
 
 Binding 未配置时返回 `502`，并带上缺少哪个 binding。后端抛错或返回 5xx 时返回 `502 {"error":"backend_unavailable","service":"<名>"}`，不透传后端原文。
 
@@ -51,6 +52,6 @@ bash abot-gateway/install-skills.sh
 - `src/admin.js`：Admin 页面前端 JS（构建时嵌入）
 - `test/basic.js`：基础测试
 - `build.js`：构建脚本
-- `wrangler.toml.example`：需要合并进现有配置的 5 个 service bindings
+- `wrangler.toml.example`：需要合并进现有配置的 6 个 service bindings
 - `skills/abot/`：给 agent 的 skill 包（`SKILL.md`、`bin/abot-mcp`、`references/`）
 - `install-skills.sh`：把 `skills/abot` 装到 `~/.muse/skills/abot/`

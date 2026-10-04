@@ -1,4 +1,4 @@
-// 本地 e2e：wrangler dev + 5 个 mock 后端。
+// 本地 e2e：wrangler dev + 6 个 mock 后端。
 // 不部署到 Cloudflare。需要人工在 Cloudflare 上做的步骤见 e2e/README.md。
 //
 // 人工步骤（本脚本不会做）：
@@ -6,7 +6,7 @@
 // 2. 把 BACKEND_DATA/MAIL/HEALTH/RULES/SECRETS 绑到真实 Worker
 // 3. 确认真实后端不再强制校验 X-Internal-Token
 // 4. 用 Cloudflare Access 审核出真实 agent secret（这里只往本地 D1 插夹具）
-// 5. 用真实 token 对 staging 再打一遍五条路由
+// 5. 用真实 token 对 staging 再打一遍六条路由
 // 6. 不要对生产后端注入 500；/__e2e_fail 只存在于本地 mock
 
 import { spawn } from "node:child_process";
@@ -34,6 +34,7 @@ const BACKENDS = [
   { name: "abot-health", config: "wrangler.health.toml", port: 8783, inspector: 9233, route: "/health/status", path: "/status", search: "" },
   { name: "abot-rules", config: "wrangler.rules.toml", port: 8784, inspector: 9234, route: "/rules/list", path: "/list", search: "" },
   { name: "abot-secrets", config: "wrangler.secrets.toml", port: 8785, inspector: 9235, route: "/secrets/names", path: "/names", search: "" },
+  { name: "abot-sms", config: "wrangler.sms.toml", port: 8786, inspector: 9236, route: "/sms/status", path: "/status", search: "" },
 ];
 
 const children = [];
