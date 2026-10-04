@@ -7,6 +7,8 @@
 
 name = "abot-gateway"
 main = "dist/worker.js"
+# 原样上传构建产物，不让 wrangler 再用 esbuild 重打包（保持与线上逐字节一致）
+no_bundle = true
 compatibility_date = "2026-09-01"
 workers_dev = false
 preview_urls = false
