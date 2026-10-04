@@ -82,7 +82,8 @@ async function sha256hex(s) {
 
 // ---- Cloudflare Access JWT 校验（admin 纵深防御） ----
 const ACCESS_TEAM = "boliam.cloudflareaccess.com";
-const ACCESS_AUD = "05d351ef-e796-4e3e-a6f4-bbcc30b98941";
+// aBot Admin（admin.abot.run）的 AUD tag。JWT 的 aud 是这个值，不是应用 UUID。
+const ACCESS_AUD = "20d26cf162fe474df036d3de12e12f893893bd7b031a4b03ec50ce3e4cdbaf99";
 let jwksCache = null;
 let jwksCacheAt = 0;
 
