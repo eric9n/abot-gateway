@@ -762,12 +762,14 @@ try {
     if (!htmlText.includes('POST https://abot.run/signup')) fail('HTML 应写明 apply_url');
     if (!htmlText.includes('Bearer &lt;access_token&gt;')) fail('HTML 里的 <access_token> 应转义后显示');
     if (htmlText.includes('mail.abot.run')) fail('申请说明不应再指向 mail.abot.run');
+    if (!htmlText.includes('<title>aBot 账户与权限申请</title>') || !htmlText.includes('<h2>aBot 账户与权限申请</h2>')) fail('HTML 标题应为 aBot 账户与权限申请');
     if (html.headers.get('x-frame-options') !== 'DENY' || !(html.headers.get('content-security-policy') || '').includes("default-src 'none'")) fail('申请页缺少安全头');
 
     const json = await call('https://abot.run/signup');
     if (json.status !== 200 || !(json.headers.get('content-type') || '').includes('application/json')) fail('GET /signup 不带 Accept 应返回 JSON');
     const info = await json.json();
     if (info.apply_url !== 'https://abot.run/signup') fail('JSON apply_url 不对: ' + info.apply_url);
+    if (info.service !== 'aBot 账户与权限申请') fail('JSON service 应为 aBot 账户与权限申请: ' + info.service);
     if (JSON.stringify(info).includes('mail.abot.run')) fail('申请说明 JSON 不应再指向 mail.abot.run');
     const legacy = await (await call('https://abot.run/provision/info')).json();
     if (JSON.stringify(legacy) !== JSON.stringify(info)) fail('/provision/info 应与 /signup JSON 一致');
@@ -819,6 +821,71 @@ try {
     if (unauth.status !== 401) fail('/signup 其它方法应落到鉴权，实际 ' + unauth.status);
   }
   console.log('   ✓ /signup 行为正确');
+
+  console.log('11m. 按 abot.run/ 的说明走完：申请 → 审核 → 换 token → MCP...');
+  {
+    const info = await (await call('https://abot.run/')).json();
+    if (info.token?.url !== 'https://abot.run/oauth/token' || info.token?.content_type !== 'application/x-www-form-urlencoded') fail('说明应写明 token 地址和表单格式');
+    if (info.mcp?.url !== 'https://abot.run/mcp' || !['initialize', 'tools/list', 'tools/call'].every((m) => info.mcp.methods.includes(m))) fail('说明应写明 MCP 地址和方法');
+    for (const f of ['grant_type=password', 'username=', 'password=']) {
+      if (!info.token.example.includes(f) || !info.steps.some((s) => s.includes(f))) fail('说明应写明 token 字段 ' + f);
+    }
+    const html = await (await call('https://abot.run/', { headers: { Accept: 'text/html' } })).text();
+    if (!html.includes('连接 MCP') || !html.includes('application/x-www-form-urlencoded')) fail('HTML 也应包含 token 和 MCP 说明');
+
+    ageRequests();
+    const applied = await (await call(info.apply_url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ invite_code: await newCode(), agent_name: 'flow', reason: 'test', requested_email: 'flow@abot.run' }),
+    })).json();
+    if (applied.status !== 'pending') fail('按说明申请应 pending: ' + JSON.stringify(applied));
+    const ap = await (await adminPost('/approve', { id: applied.id, email: 'flow@abot.run' })).json();
+    const st = await (await call(info.status_url.replace('<申请 id>', applied.id))).json();
+    if (st.status !== 'approved' || st.email !== 'flow@abot.run') fail('status_url 应显示已通过: ' + JSON.stringify(st));
+
+    const asJson = await call(info.token.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant_type: 'password', username: 'flow@abot.run', password: ap.secret }),
+    });
+    const asJsonBody = await asJson.json();
+    if (asJson.status !== 400 || asJsonBody.error !== 'invalid_request' || !asJsonBody.message.includes('x-www-form-urlencoded')) {
+      fail('JSON 提交 /oauth/token 应 400 并提示用表单: ' + asJson.status + ' ' + JSON.stringify(asJsonBody));
+    }
+    const noBody = await call(info.token.url, { method: 'POST' });
+    if (noBody.status !== 400) fail('/oauth/token 无 body 应 400，实际 ' + noBody.status);
+
+    const tok = await call(info.token.url, {
+      method: 'POST',
+      headers: { 'Content-Type': info.token.content_type },
+      body: new URLSearchParams({ grant_type: 'password', username: 'flow@abot.run', password: ap.secret }).toString(),
+    });
+    const tokBody = await tok.json();
+    if (tok.status !== 200 || !tokBody.access_token?.startsWith('abot_')) fail('按说明的表单换 token 应成功: ' + JSON.stringify(tokBody));
+
+    let owner = null;
+    const mcpEnv = {
+      DB: D1,
+      BACKEND_MAIL: {
+        async fetch(url, init) {
+          owner = new Headers(init.headers).get('X-Abot-Owner-Email');
+          return Response.json({ result: { tools: [{ name: 'send', description: 's', inputSchema: { type: 'object' } }] } });
+        },
+      },
+    };
+    const rpc = (method) => built.fetch(new Request(info.mcp.url, {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + tokBody.access_token, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method }),
+    }), mcpEnv);
+    const init = await (await rpc('initialize')).json();
+    if (init.result?.serverInfo?.name !== 'aBot') fail('MCP initialize 失败: ' + JSON.stringify(init));
+    const listed = await (await rpc('tools/list')).json();
+    if (!(listed.result?.tools || []).some((t) => t.name === 'mail_send')) fail('MCP tools/list 应含 mail_send: ' + JSON.stringify(listed));
+    if (owner !== 'flow@abot.run') fail('MCP 应以申请到的邮箱身份调用后端，实际 ' + owner);
+  }
+  console.log('   ✓ 说明里的流程可以走通');
 } finally {
   globalThis.fetch = savedFetch;
 }
