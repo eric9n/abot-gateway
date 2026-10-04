@@ -5,6 +5,7 @@ const ROUTES = {
   "/health/": "BACKEND_HEALTH",
   "/rules/": "BACKEND_RULES",
   "/secrets/": "BACKEND_SECRETS",
+  "/sms/": "BACKEND_SMS",
 };
 
 function routeServiceName(prefix) {
@@ -82,7 +83,8 @@ async function sha256hex(s) {
 
 // ---- Cloudflare Access JWT 校验（admin 纵深防御） ----
 const ACCESS_TEAM = "boliam.cloudflareaccess.com";
-const ACCESS_AUD = "05d351ef-e796-4e3e-a6f4-bbcc30b98941";
+// aBot Admin（admin.abot.run）的 AUD tag。JWT 的 aud 是这个值，不是应用 UUID。
+const ACCESS_AUD = "20d26cf162fe474df036d3de12e12f893893bd7b031a4b03ec50ce3e4cdbaf99";
 let jwksCache = null;
 let jwksCacheAt = 0;
 
@@ -461,6 +463,7 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       ).join("");
       return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 审核</title><script>
 /*__ADMIN_JS__*/
+console.error("admin.js 未嵌入：请先 node build.js 再部署");
 </script>
 <style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:20px}
 button{padding:8px 20px;margin:4px;font-size:14px;cursor:pointer}
@@ -609,6 +612,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
           { prefix: "health", binding: ROUTES["/health/"] },
           { prefix: "rules", binding: ROUTES["/rules/"] },
           { prefix: "secrets", binding: ROUTES["/secrets/"] },
+          { prefix: "sms", binding: ROUTES["/sms/"] },
         ];
         
         async function callBackend(svc, rpcPayload, timeoutMs) {
@@ -730,7 +734,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       }
     }
     if (!route) {
-      return Response.json({ error: "unknown service, use /data/, /mail/, /health/, /rules/, /secrets/" }, { status: 404 });
+      return Response.json({ error: "unknown service, use /data/, /mail/, /health/, /rules/, /secrets/, /sms/" }, { status: 404 });
     }
 
     const bindingName = route;

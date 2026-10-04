@@ -3,7 +3,7 @@
 # 不要用本文件执行 wrangler deploy：线上的 D1 binding（DB）和路由必须原样保留。
 # CI 部署用的是 wrangler.toml；本文件不会被自动部署。
 #
-# 网关与这 5 个后端必须在同一个 Cloudflare 账号。
+# 网关与这 6 个后端必须在同一个 Cloudflare 账号。
 # service 是 Worker 脚本名（原先 *.workers.dev 主机名的第一段）。
 
 [[services]]
@@ -25,3 +25,7 @@ service = "abot-rules"
 [[services]]
 binding = "BACKEND_SECRETS"
 service = "abot-secrets"
+
+[[services]]
+binding = "BACKEND_SMS"
+service = "abot-sms"

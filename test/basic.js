@@ -29,6 +29,21 @@ if (!workerSrc.includes('/*__ADMIN_JS__*/')) {
 }
 console.log('   ✓ 占位符存在');
 
+console.log('3b. 构建后 admin.js 必须嵌进页面...');
+{
+  execSync('node build.js', { stdio: 'pipe' });
+  const dist = readFileSync('dist/worker.js', 'utf8');
+  if (dist.includes('/*__ADMIN_JS__*/') || dist.includes('admin.js 未嵌入')) {
+    console.error('   ✗ dist 仍是未构建的 admin 占位');
+    process.exit(1);
+  }
+  if (!dist.includes("postJSON('invite'") || !dist.includes('data-action="invite"')) {
+    console.error('   ✗ dist 缺少生成邀请码的脚本');
+    process.exit(1);
+  }
+  console.log('   ✓ admin.js 已嵌入');
+}
+
 console.log('4. 检查关键路由...');
 const routes = ['/mcp', '/oauth/authorize', '/oauth/token', '/oauth/register', '/admin'];
 for (const r of routes) {
@@ -76,7 +91,7 @@ for (const [s, name] of bad) {
 console.log('   ✓ 无危险模式');
 
 console.log('7. 检查 Service Binding...');
-const bindings = ['BACKEND_DATA', 'BACKEND_MAIL', 'BACKEND_HEALTH', 'BACKEND_RULES', 'BACKEND_SECRETS'];
+const bindings = ['BACKEND_DATA', 'BACKEND_MAIL', 'BACKEND_HEALTH', 'BACKEND_RULES', 'BACKEND_SECRETS', 'BACKEND_SMS'];
 for (const name of bindings) {
   if (!workerSrc.includes(name)) { console.error(`   ✗ 缺少 binding ${name}`); process.exit(1); }
 }
@@ -262,6 +277,68 @@ console.log('9. MCP 聚合：binding、不泄漏后端原文...');
   }
 }
 console.log('   ✓ MCP 聚合行为正确');
+
+console.log('10. Admin Access JWT 校验 AUD tag...');
+{
+  const AUD = "20d26cf162fe474df036d3de12e12f893893bd7b031a4b03ec50ce3e4cdbaf99";
+  const APP_ID = "05d351ef-e796-4e3e-a6f4-bbcc30b98941";
+  if (!workerSrc.includes(`const ACCESS_AUD = "${AUD}"`)) fail("ACCESS_AUD 必须是 Access 应用的 aud tag");
+  if (workerSrc.includes(APP_ID)) fail("ACCESS_AUD 不能写成应用 UUID");
+
+  const pair = await crypto.subtle.generateKey(
+    { name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" },
+    true,
+    ["sign", "verify"]
+  );
+  const exported = await crypto.subtle.exportKey("jwk", pair.publicKey);
+  const jwk = { kid: "test-kid", kty: "RSA", alg: "RS256", use: "sig", e: exported.e, n: exported.n };
+  function b64url(bytes) {
+    return Buffer.from(bytes).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  }
+  async function signJwt(aud) {
+    const header = b64url(new TextEncoder().encode(JSON.stringify({ alg: "RS256", kid: "test-kid", typ: "JWT" })));
+    const payload = b64url(new TextEncoder().encode(JSON.stringify({
+      aud,
+      exp: Math.floor(Date.now() / 1000) + 3600,
+      iss: "https://boliam.cloudflareaccess.com",
+    })));
+    const data = new TextEncoder().encode(header + "." + payload);
+    const sig = new Uint8Array(await crypto.subtle.sign("RSASSA-PKCS1-v1_5", pair.privateKey, data));
+    return header + "." + payload + "." + b64url(sig);
+  }
+
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    if (String(url).includes("/cdn-cgi/access/certs")) return Response.json({ keys: [jwk] });
+    throw new Error("unexpected fetch " + url);
+  };
+  try {
+    const good = await worker.fetch(new Request("https://admin.abot.run/", {
+      headers: { "Cf-Access-Jwt-Assertion": await signJwt([AUD]) },
+    }), { DB: mockDb() });
+    const goodText = await good.text();
+    if (good.status !== 200 || !goodText.includes("aBot 新 Agent 审核")) {
+      fail("正确 AUD 的 Access JWT 应放行 admin，实际 " + good.status + " " + goodText.slice(0, 180));
+    }
+
+    const denied = await worker.fetch(new Request("https://admin.abot.run/", {
+      headers: { "Cf-Access-Jwt-Assertion": await signJwt(APP_ID) },
+    }), { DB: mockDb() });
+    const deniedText = await denied.text();
+    if (denied.status !== 403 || deniedText !== "forbidden: invalid Access token") {
+      fail("应用 UUID 不应作为 aud 通过: " + denied.status + " " + deniedText);
+    }
+
+    const missing = await worker.fetch(new Request("https://admin.abot.run/"));
+    const missingText = await missing.text();
+    if (missing.status !== 403 || !missingText.includes("Cloudflare Access required")) {
+      fail("缺少 JWT 应拒绝: " + missing.status + " " + missingText);
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+console.log('   ✓ Access AUD tag 校验正确');
 
 console.log('检查 install-skills.sh 的仓库地址...');
 execSync('bash test/install-skills-urls.sh', { stdio: 'inherit' });

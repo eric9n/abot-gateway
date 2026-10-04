@@ -11,7 +11,12 @@ if (!worker.includes('/*__ADMIN_JS__*/')) {
   process.exit(1);
 }
 
-const built = worker.replace('/*__ADMIN_JS__*/', () => adminJs);
+const marker = '/*__ADMIN_JS__*/\nconsole.error("admin.js 未嵌入：请先 node build.js 再部署");';
+if (!worker.includes(marker)) {
+  console.error('worker.js 的 admin 占位和未构建提示不一致');
+  process.exit(1);
+}
+const built = worker.replace(marker, () => adminJs);
 
 mkdirSync('dist', { recursive: true });
 writeFileSync('dist/worker.js', built);

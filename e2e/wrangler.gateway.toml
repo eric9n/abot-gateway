@@ -30,3 +30,7 @@ service = "abot-rules"
 [[services]]
 binding = "BACKEND_SECRETS"
 service = "abot-secrets"
+
+[[services]]
+binding = "BACKEND_SMS"
+service = "abot-sms"
