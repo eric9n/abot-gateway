@@ -109,6 +109,46 @@ async function sha256hex(s) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
+const SIGNUP_INFO = {
+  service: "aBot 邮箱申请",
+  steps: [
+    "向你的主人要一个邀请码（一小时有效，一次性）",
+    "想一个你想要的邮箱地址，必须是 xxx@abot.run 格式",
+    "POST https://abot.run/signup 提交申请",
+    "提交后等待主人审核，通过后主人会把 secret 发给你",
+    "用邮箱 + secret 调 POST https://abot.run/oauth/token (grant_type=password) 换取 access_token",
+    "以后调 https://abot.run/mcp 时带 Authorization: Bearer <access_token>",
+  ],
+  request_format: {
+    invite_code: "inv_...（必填，主人给的）",
+    agent_name: "你的名字（必填）",
+    reason: "用途说明（必填）",
+    requested_email: "想要的邮箱，如 mybot@abot.run（选填，主人可改）",
+  },
+  apply_url: "https://abot.run/signup",
+  status_url: "https://abot.run/provision/status?id=<申请 id>",
+};
+
+// 页面只含 SIGNUP_INFO 的静态文本；仍要 esc()，否则 "<access_token>" 会被浏览器当成标签吞掉
+function signupPage(request) {
+  const accept = request.headers.get("accept") || "";
+  if (!accept.includes("text/html")) return Response.json(SIGNUP_INFO);
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>aBot 邮箱申请</title>
+<style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:20px;line-height:1.6}
+code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5;padding:12px;border-radius:8px;overflow:auto}</style>
+</head><body><h2>aBot 邮箱申请</h2>
+<ol>${SIGNUP_INFO.steps.map((s) => `<li>${esc(s)}</li>`).join("")}</ol>
+<h3>申请格式</h3><pre>${esc(JSON.stringify(SIGNUP_INFO.request_format, null, 2))}</pre>
+<p>提交地址：<code>POST ${esc(SIGNUP_INFO.apply_url)}</code></p></body></html>`;
+  return new Response(html, {
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "x-frame-options": "DENY",
+      "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'",
+    },
+  });
+}
+
 // ---- Cloudflare Access JWT 校验（admin 纵深防御） ----
 const ACCESS_TEAM = "boliam.cloudflareaccess.com";
 // aBot Admin（admin.abot.run）的 AUD tag。JWT 的 aud 是这个值，不是应用 UUID。
@@ -527,27 +567,12 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
 
     // ---- Provision：新 agent 申请身份（需人工审核） ----
 
-    // 申请说明（agent 自助读取）
-    if (path === "/provision/info" && request.method === "GET") {
-      return Response.json({
-        service: "aBot Agent 邮箱申请",
-        note: "已迁移到 https://mail.abot.run/signup",
-        steps: [
-          "向你的主人要一个邀请码（一小时有效，一次性）",
-          "想一个你想要的邮箱地址，必须是 xxx@abot.run 格式",
-          "POST https://mail.abot.run/signup 提交申请",
-          "提交后等待主人审核，通过后主人会联系你",
-        ],
-        request_format: {
-          invite_code: "inv_...（必填，主人给的）",
-          agent_name: "你的名字（必填）",
-          reason: "用途说明（必填）",
-          requested_email: "想要的邮箱，如 mybot@abot.run（选填，主人可改）",
-        },
-      });
+    // 申请说明（agent 自助读取；浏览器访问返回 HTML）
+    if ((path === "/signup" || path === "/provision/info") && request.method === "GET") {
+      return signupPage(request);
     }
 
-    if (path === "/provision/request" && request.method === "POST") {
+    if ((path === "/provision/request" || path === "/signup") && request.method === "POST") {
       await ensureOAuthTables(env);
       let body;
       try { body = await request.json(); } catch { body = {}; }
@@ -557,9 +582,14 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       if (!inviteCode) {
         return Response.json({ error: "invite_code_required", message: "需要邀请码才能申请" }, { status: 400 });
       }
+      // 填了就必须合法（与审批用同一个 EMAIL_RE），在占用邀请码之前拒绝
+      const rawEmail = typeof body.requested_email === "string" ? body.requested_email.trim() : "";
+      const requestedEmail = rawEmail ? normalizeEmail(rawEmail) : null;
+      if (rawEmail && !requestedEmail) {
+        return Response.json({ error: "invalid_email", message: "邮箱必须是 xxx@abot.run，只含小写字母、数字、._-" }, { status: 400 });
+      }
       const codeHash = await sha256hex(inviteCode);
       const id = newId("prov");
-      const requestedEmail = (typeof body.requested_email === "string" ? body.requested_email : "").trim().toLowerCase().slice(0, 254) || null;
       const text = (v) => (v == null ? null : String(v).slice(0, 2000));
       // 先原子占用邀请码（未用、1 小时内、全局最近 1 小时申请不足 10 个），占用成功才插入申请。
       // 两条语句在同一事务里；插入以 used_by=本次 id 为条件。

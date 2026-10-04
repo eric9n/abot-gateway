@@ -753,6 +753,65 @@ try {
     if (ak.state.certFetches !== before + 1) fail('强制刷新应有间隔，防止伪造 kid 刷 JWKS');
   }
   console.log('   ✓ Access JWT 校验正确');
+
+  console.log('11l. /signup：申请说明、与 /provision/request 等价、邮箱校验...');
+  {
+    const html = await call('https://abot.run/signup', { headers: { Accept: 'text/html,application/xhtml+xml' } });
+    const htmlText = await html.text();
+    if (html.status !== 200 || !(html.headers.get('content-type') || '').startsWith('text/html')) fail('GET /signup 带 Accept: text/html 应返回 HTML');
+    if (!htmlText.includes('POST https://abot.run/signup')) fail('HTML 应写明 apply_url');
+    if (!htmlText.includes('Bearer &lt;access_token&gt;')) fail('HTML 里的 <access_token> 应转义后显示');
+    if (htmlText.includes('mail.abot.run')) fail('申请说明不应再指向 mail.abot.run');
+    if (html.headers.get('x-frame-options') !== 'DENY' || !(html.headers.get('content-security-policy') || '').includes("default-src 'none'")) fail('申请页缺少安全头');
+
+    const json = await call('https://abot.run/signup');
+    if (json.status !== 200 || !(json.headers.get('content-type') || '').includes('application/json')) fail('GET /signup 不带 Accept 应返回 JSON');
+    const info = await json.json();
+    if (info.apply_url !== 'https://abot.run/signup') fail('JSON apply_url 不对: ' + info.apply_url);
+    if (JSON.stringify(info).includes('mail.abot.run')) fail('申请说明 JSON 不应再指向 mail.abot.run');
+    const legacy = await (await call('https://abot.run/provision/info')).json();
+    if (JSON.stringify(legacy) !== JSON.stringify(info)) fail('/provision/info 应与 /signup JSON 一致');
+
+    const post = (path, code, extra = {}) => call('https://abot.run' + path, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ invite_code: code, agent_name: 'bot', reason: 'test', ...extra }),
+    });
+    for (const path of ['/signup', '/provision/request']) {
+      ageRequests();
+      const code = await newCode();
+      const r1 = await post(path, code, { requested_email: ' MyBot@abot.run ' });
+      const b1 = await r1.json();
+      if (r1.status !== 200 || b1.status !== 'pending' || !b1.id) fail(path + ' 首次申请应 pending: ' + JSON.stringify(b1));
+      if (q1('SELECT requested_email FROM provision_requests WHERE id=?', b1.id).requested_email !== 'mybot@abot.run') fail(path + ' requested_email 应规范化');
+      const st = await (await call('https://abot.run/provision/status?id=' + b1.id)).json();
+      if (st.status !== 'pending') fail(path + ' 申请后 status 应为 pending');
+      const r2 = await post(path, code);
+      if (r2.status !== 403 || (await r2.json()).error !== 'invite_code_used') fail(path + ' 重复使用邀请码应 403 invite_code_used');
+    }
+
+    for (const path of ['/signup', '/provision/request']) {
+      for (const email of ['x@evil.com', 'A@abot.run.evil', 'a..b@abot.run']) {
+        ageRequests();
+        const code = await newCode();
+        const before = q1('SELECT COUNT(*) c FROM provision_requests').c;
+        const r = await post(path, code, { requested_email: email });
+        const b = await r.json();
+        if (r.status !== 400 || b.error !== 'invalid_email') fail(path + ' 非法邮箱 ' + email + ' 应 400 invalid_email，实际 ' + r.status + ' ' + JSON.stringify(b));
+        if (q1('SELECT used_at FROM invite_codes WHERE code=?', code)?.used_at !== null) fail('非法邮箱不应消耗邀请码');
+        if (q1('SELECT COUNT(*) c FROM provision_requests').c !== before) fail('非法邮箱不应写入申请');
+        if ((await post(path, code)).status !== 200) fail('非法邮箱被拒后邀请码应仍可用');
+      }
+    }
+
+    ageRequests();
+    const noEmail = await (await post('/signup', await newCode(), { requested_email: '' })).json();
+    if (noEmail.status !== 'pending' || q1('SELECT requested_email FROM provision_requests WHERE id=?', noEmail.id).requested_email !== null) fail('空 requested_email 应视为未填');
+
+    const unauth = await call('https://abot.run/signup', { method: 'PUT' });
+    if (unauth.status !== 401) fail('/signup 其它方法应落到鉴权，实际 ' + unauth.status);
+  }
+  console.log('   ✓ /signup 行为正确');
 } finally {
   globalThis.fetch = savedFetch;
 }
