@@ -6,7 +6,23 @@ function postJSON(path, data) {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(data)
-  }).then(function(r) { return r.json(); });
+  }).then(function(r) {
+    return r.text().then(function(text) {
+      var body = {};
+      try { body = text ? JSON.parse(text) : {}; }
+      catch (e) { body = { error: text.slice(0, 200) || ('HTTP ' + r.status) }; }
+      if (!r.ok || body.ok === false) {
+        throw new Error(body.message || body.error || ('HTTP ' + r.status));
+      }
+      return body;
+    });
+  });
+}
+
+function reportFail(e) {
+  var msg = (e && e.message) || String(e);
+  console.error(msg);
+  alert('失败: ' + msg);
 }
 
 function showSecret(container, secret) {
@@ -62,9 +78,8 @@ document.addEventListener('DOMContentLoaded', function() {
       var id = btn.getAttribute('data-id');
       var container = btn.closest('.agent-row');
       postJSON('rotate', {id: id}).then(function(r) {
-        if (r.ok) showSecret(container, r.secret);
-        else alert('失败: ' + (r.error || '未知'));
-      });
+        showSecret(container, r.secret);
+      }).catch(reportFail);
     });
   });
   
@@ -72,10 +87,9 @@ document.addEventListener('DOMContentLoaded', function() {
   document.querySelectorAll('[data-action="revoke"]').forEach(function(btn) {
     btn.addEventListener('click', function() {
       var id = btn.getAttribute('data-id');
-      postJSON('revoke', {id: id}).then(function(r) {
-        if (r.ok) location.reload();
-        else alert('失败');
-      });
+      postJSON('revoke', {id: id}).then(function() {
+        location.reload();
+      }).catch(reportFail);
     });
   });
   
@@ -84,8 +98,8 @@ document.addEventListener('DOMContentLoaded', function() {
   if (inviteBtn) {
     inviteBtn.addEventListener('click', function() {
       postJSON('invite', {}).then(function(r) {
-        if (r.ok) showCode(r.code);
-      });
+        showCode(r.code);
+      }).catch(reportFail);
     });
   }
   
@@ -97,9 +111,8 @@ document.addEventListener('DOMContentLoaded', function() {
       if (!email) return;
       var container = btn.closest('.req-row');
       postJSON('approve', {id: id, email: email}).then(function(r) {
-        if (r.ok) showSecret(container, r.secret);
-        else alert('失败: ' + (r.error || r.message || '未知'));
-      });
+        showSecret(container, r.secret);
+      }).catch(reportFail);
     });
   });
   
@@ -107,9 +120,9 @@ document.addEventListener('DOMContentLoaded', function() {
   document.querySelectorAll('[data-action="deny"]').forEach(function(btn) {
     btn.addEventListener('click', function() {
       var id = btn.getAttribute('data-id');
-      postJSON('deny', {id: id}).then(function(r) {
-        if (r.ok) location.reload();
-      });
+      postJSON('deny', {id: id}).then(function() {
+        location.reload();
+      }).catch(reportFail);
     });
   });
 });

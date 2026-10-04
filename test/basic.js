@@ -29,6 +29,21 @@ if (!workerSrc.includes('/*__ADMIN_JS__*/')) {
 }
 console.log('   ✓ 占位符存在');
 
+console.log('3b. 构建后 admin.js 必须嵌进页面...');
+{
+  execSync('node build.js', { stdio: 'pipe' });
+  const dist = readFileSync('dist/worker.js', 'utf8');
+  if (dist.includes('/*__ADMIN_JS__*/') || dist.includes('admin.js 未嵌入')) {
+    console.error('   ✗ dist 仍是未构建的 admin 占位');
+    process.exit(1);
+  }
+  if (!dist.includes("postJSON('invite'") || !dist.includes('data-action="invite"')) {
+    console.error('   ✗ dist 缺少生成邀请码的脚本');
+    process.exit(1);
+  }
+  console.log('   ✓ admin.js 已嵌入');
+}
+
 console.log('4. 检查关键路由...');
 const routes = ['/mcp', '/oauth/authorize', '/oauth/token', '/oauth/register', '/admin'];
 for (const r of routes) {
