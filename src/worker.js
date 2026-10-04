@@ -462,6 +462,7 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       ).join("");
       return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 审核</title><script>
 /*__ADMIN_JS__*/
+console.error("admin.js 未嵌入：请先 node build.js 再部署");
 </script>
 <style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:20px}
 button{padding:8px 20px;margin:4px;font-size:14px;cursor:pointer}
