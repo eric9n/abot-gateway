@@ -596,6 +596,33 @@ try {
     if (html.includes(used)) fail('已用邀请码不应列出');
   }
   console.log('   ✓ 邀请码列表正确');
+
+  console.log('11h. 构建：admin.js 原样嵌入页面，特殊字符不破坏模板...');
+  {
+    const adminSrc = readFileSync('src/admin.js', 'utf8');
+    const html = await (await adminGet()).text();
+    if (!html.includes(adminSrc)) fail('页面里的脚本应与 src/admin.js 逐字节一致');
+
+    const { mkdtempSync, mkdirSync, writeFileSync, copyFileSync } = await import('fs');
+    const { tmpdir } = await import('os');
+    const path = await import('path');
+    const dir = mkdtempSync(path.join(tmpdir(), 'abot-build-'));
+    mkdirSync(path.join(dir, 'src'));
+    copyFileSync('build.js', path.join(dir, 'build.js'));
+    copyFileSync('src/worker.js', path.join(dir, 'src/worker.js'));
+    const tricky = adminSrc + '\nvar t = `${1}` + "\\\\" + \'\\u2028\' + "$&$1"; // 反引号 ` 与 ${x}\n';
+    writeFileSync(path.join(dir, 'src/admin.js'), tricky);
+    execSync('node build.js', { cwd: dir, stdio: 'pipe' });
+    const trickyWorker = (await import(path.join(dir, 'dist/worker.js'))).default;
+    const page = await (await trickyWorker.fetch(new Request(ADMIN + '/', { headers: { 'Cf-Access-Jwt-Assertion': J } }), env)).text();
+    if (!page.includes(tricky)) fail('含反引号/${/反斜杠的 admin.js 应原样嵌入');
+
+    writeFileSync(path.join(dir, 'src/admin.js'), adminSrc + '\n// </script>\n');
+    let rejected = false;
+    try { execSync('node build.js', { cwd: dir, stdio: 'pipe' }); } catch { rejected = true; }
+    if (!rejected) fail('admin.js 含 </script 时构建应失败');
+  }
+  console.log('   ✓ 构建嵌入正确');
 } finally {
   globalThis.fetch = savedFetch;
 }

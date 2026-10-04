@@ -37,6 +37,9 @@ function esc(s) {
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
+// 构建时 build.js 把 src/admin.js 以 JSON 字符串字面量替换到这里
+const ADMIN_JS = /*__ADMIN_JS__*/"console.error(\"admin.js 未嵌入：请先 node build.js 再部署\");";
+
 const STATUS_LABELS = { pending: "待审核", approved: "已通过", denied: "已拒绝", revoked: "已吊销" };
 
 // 通用 500（不泄漏内部细节）
@@ -492,10 +495,7 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
             </div>` : ""}
         </div>`
       ).join("");
-      return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 审核</title><script>
-/*__ADMIN_JS__*/
-console.error("admin.js 未嵌入：请先 node build.js 再部署");
-</script>
+      return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 审核</title><script>${ADMIN_JS}</script>
 <style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:20px}
 button{padding:8px 20px;margin:4px;font-size:14px;cursor:pointer}
 .newcode{background:#e8f5e9;border:1px solid #4caf50;border-radius:8px;padding:12px;margin:12px 0;word-break:break-all}</style>
