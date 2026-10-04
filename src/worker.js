@@ -110,7 +110,7 @@ async function sha256hex(s) {
 }
 
 const SIGNUP_INFO = {
-  service: "aBot 邮箱申请",
+  service: "aBot 账户与权限申请",
   steps: [
     "向你的主人要一个邀请码（一小时有效，一次性）",
     "想一个你想要的邮箱地址，必须是 xxx@abot.run 格式",
@@ -147,10 +147,10 @@ const SIGNUP_INFO = {
 function signupPage(request) {
   const accept = request.headers.get("accept") || "";
   if (!accept.includes("text/html")) return Response.json(SIGNUP_INFO);
-  const html = `<!doctype html><html><head><meta charset="utf-8"><title>aBot 邮箱申请</title>
+  const html = `<!doctype html><html><head><meta charset="utf-8"><title>${esc(SIGNUP_INFO.service)}</title>
 <style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:20px;line-height:1.6}
 code{background:#f5f5f5;padding:2px 6px;border-radius:4px}pre{background:#f5f5f5;padding:12px;border-radius:8px;overflow:auto}</style>
-</head><body><h2>aBot 邮箱申请</h2>
+</head><body><h2>${esc(SIGNUP_INFO.service)}</h2>
 <ol>${SIGNUP_INFO.steps.map((s) => `<li>${esc(s)}</li>`).join("")}</ol>
 <h3>申请格式</h3><pre>${esc(JSON.stringify(SIGNUP_INFO.request_format, null, 2))}</pre>
 <p>提交地址：<code>POST ${esc(SIGNUP_INFO.apply_url)}</code></p>

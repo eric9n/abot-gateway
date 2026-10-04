@@ -762,12 +762,14 @@ try {
     if (!htmlText.includes('POST https://abot.run/signup')) fail('HTML 应写明 apply_url');
     if (!htmlText.includes('Bearer &lt;access_token&gt;')) fail('HTML 里的 <access_token> 应转义后显示');
     if (htmlText.includes('mail.abot.run')) fail('申请说明不应再指向 mail.abot.run');
+    if (!htmlText.includes('<title>aBot 账户与权限申请</title>') || !htmlText.includes('<h2>aBot 账户与权限申请</h2>')) fail('HTML 标题应为 aBot 账户与权限申请');
     if (html.headers.get('x-frame-options') !== 'DENY' || !(html.headers.get('content-security-policy') || '').includes("default-src 'none'")) fail('申请页缺少安全头');
 
     const json = await call('https://abot.run/signup');
     if (json.status !== 200 || !(json.headers.get('content-type') || '').includes('application/json')) fail('GET /signup 不带 Accept 应返回 JSON');
     const info = await json.json();
     if (info.apply_url !== 'https://abot.run/signup') fail('JSON apply_url 不对: ' + info.apply_url);
+    if (info.service !== 'aBot 账户与权限申请') fail('JSON service 应为 aBot 账户与权限申请: ' + info.service);
     if (JSON.stringify(info).includes('mail.abot.run')) fail('申请说明 JSON 不应再指向 mail.abot.run');
     const legacy = await (await call('https://abot.run/provision/info')).json();
     if (JSON.stringify(legacy) !== JSON.stringify(info)) fail('/provision/info 应与 /signup JSON 一致');
