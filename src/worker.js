@@ -163,6 +163,148 @@ async function requireAccess(request) {
   }
 }
 
+const ADMIN_HOST = "admin.abot.run";
+const ADMIN_ORIGIN = "https://" + ADMIN_HOST;
+const ADMIN_POST_PATHS = ["/approve", "/deny", "/invite", "/rotate", "/revoke"];
+
+// 管理页 POST 的 CSRF 防护：只收 JSON，且必须来自 admin 页本身
+function rejectCrossSite(request) {
+  const type = (request.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+  const origin = request.headers.get("Origin");
+  const sameOrigin = origin ? origin === ADMIN_ORIGIN : request.headers.get("Sec-Fetch-Site") === "same-origin";
+  if (type === "application/json" && sameOrigin) return null;
+  return Response.json({ ok: false, error: "csrf_rejected" }, { status: 403, headers: { "Cache-Control": "no-store" } });
+}
+
+function adminPageHeaders(nonce) {
+  return {
+    "Content-Type": "text/html;charset=utf-8",
+    "Content-Security-Policy": [
+      "default-src 'none'",
+      "script-src 'nonce-" + nonce + "'",
+      "style-src 'unsafe-inline'",
+      "connect-src 'self'",
+      "frame-ancestors 'none'",
+      "base-uri 'none'",
+      "form-action 'self'",
+    ].join("; "),
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+  };
+}
+
+function newSecret() {
+  return "ask_" + [...crypto.getRandomValues(new Uint8Array(18))].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// 管理页 POST。调用前已校验 Access JWT、CSRF，解析好 JSON body 并建好表；异常由调用方转成 500。
+async function handleAdminPost(path, body, env) {
+  const id = typeof body.id === "string" ? body.id : "";
+
+  // 生成邀请码（只显示一次）
+  if (path === "/invite") {
+    const code = "inv_" + [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, "0")).join("");
+    const hash = await sha256hex(code);
+    await env.DB.prepare("INSERT INTO invite_codes (code_hash, code) VALUES (?,?)").bind(hash, code).run();
+    return Response.json({ ok: true, code });
+  }
+
+  // 吊销：申请标记 revoked，secret / token / 授权码全部失效
+  if (path === "/revoke") {
+    const req = await env.DB.prepare("SELECT email, status FROM provision_requests WHERE id=?").bind(id).first();
+    if (!req || !req.email) return Response.json({ ok: false, error: "not_found" }, { status: 404 });
+    if (req.status !== "approved") {
+      return Response.json({ ok: false, error: "not_approved", message: "该申请当前不是已通过状态" }, { status: 409 });
+    }
+    await env.DB.batch([
+      env.DB.prepare("UPDATE provision_requests SET status='revoked', secret_hash=NULL WHERE id=?").bind(id),
+      env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=? AND revoked_at IS NULL").bind(req.email),
+      env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email),
+      env.DB.prepare("DELETE FROM gw_oauth_codes WHERE email=?").bind(req.email),
+    ]);
+    return Response.json({ ok: true });
+  }
+
+  // 换 Secret：生成新的 ask_，旧的失效（仅限 approved）
+  if (path === "/rotate") {
+    const req = await env.DB.prepare("SELECT email FROM provision_requests WHERE id=? AND status='approved'").bind(id).first();
+    if (!req || !req.email) return Response.json({ ok: false, error: "not_found" }, { status: 404 });
+    const secret = newSecret();
+    const secretHash = await sha256hex(secret);
+    // 新 token 只在申请仍为 approved 时写入，避免与并发吊销交错后复活凭证
+    const results = await env.DB.batch([
+      env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=? AND revoked_at IS NULL").bind(req.email),
+      env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email),
+      env.DB.prepare("DELETE FROM gw_oauth_codes WHERE email=?").bind(req.email),
+      env.DB.prepare("UPDATE provision_requests SET secret_hash=? WHERE id=? AND status='approved'").bind(secretHash, id),
+      env.DB.prepare("INSERT INTO agent_tokens (token_hash, email, request_id) SELECT ?, email, id FROM provision_requests WHERE id=? AND status='approved' AND email=?").bind(secretHash, id, req.email),
+    ]);
+    if (results[4].meta.changes !== 1) {
+      return Response.json({ ok: false, error: "not_approved", message: "该申请已不是已通过状态" }, { status: 409 });
+    }
+    return Response.json({ ok: true, email: req.email, secret });
+  }
+
+  if (path === "/deny") {
+    const r = await env.DB.prepare("UPDATE provision_requests SET status='denied' WHERE id=? AND status='pending'").bind(id).run();
+    if (r.meta.changes === 1) return Response.json({ ok: true });
+    const cur = await env.DB.prepare("SELECT status FROM provision_requests WHERE id=?").bind(id).first();
+    if (!cur) return Response.json({ ok: false, error: "not_found", message: "申请不存在" }, { status: 404 });
+    if (cur.status === "approved") {
+      return Response.json({ ok: false, error: "already_approved", message: "已通过的申请不能拒绝，请用「吊销」" }, { status: 409 });
+    }
+    return Response.json({ ok: false, error: "not_pending", message: "该申请已处理（" + cur.status + "）" }, { status: 409 });
+  }
+
+  if (path === "/approve") {
+    // 通过：手动邮箱 + 生成 secret + 建 mailbox 记录
+    const email = normalizeEmail(body.email);
+    if (!email) {
+      return Response.json({ ok: false, error: "invalid_email", message: "邮箱必须是 xxx@abot.run，只能含小写字母、数字和 ._-，首尾为字母或数字" }, { status: 400 });
+    }
+    const cur = await env.DB.prepare("SELECT status FROM provision_requests WHERE id=?").bind(id).first();
+    if (!cur) return Response.json({ ok: false, error: "not_found", message: "申请不存在" }, { status: 404 });
+    if (cur.status !== "pending") {
+      return Response.json({ ok: false, error: "not_pending", message: "该申请已处理（" + cur.status + "）" }, { status: 409 });
+    }
+    // 分配过的邮箱（含已吊销）不再复用，避免新 agent 读到旧邮件
+    const dup = await env.DB.prepare(
+      "SELECT 1 AS x FROM provision_requests WHERE email=? UNION ALL SELECT 1 FROM mailboxes WHERE email=? LIMIT 1"
+    ).bind(email, email).first();
+    if (dup) {
+      return Response.json({ ok: false, error: "email_taken", message: "该邮箱已分配" }, { status: 409 });
+    }
+    const secret = newSecret();
+    const secretHash = await sha256hex(secret);
+    // 一个事务：只有把 pending 改成 approved 的这次请求才会写 token / mailbox（以本次 secret_hash 为凭）。
+    // 邮箱唯一由 provision_requests 唯一索引和 mailboxes 主键兜底，冲突时整体回滚。
+    let results;
+    try {
+      results = await env.DB.batch([
+        env.DB.prepare("UPDATE provision_requests SET status='approved', email=?, secret_hash=? WHERE id=? AND status='pending'")
+          .bind(email, secretHash, id),
+        env.DB.prepare("INSERT INTO agent_tokens (token_hash, email, request_id) SELECT secret_hash, email, id FROM provision_requests WHERE id=? AND status='approved' AND secret_hash=?")
+          .bind(id, secretHash),
+        env.DB.prepare("INSERT INTO mailboxes (email, request_id) SELECT email, id FROM provision_requests WHERE id=? AND status='approved' AND secret_hash=?")
+          .bind(id, secretHash),
+      ]);
+    } catch (e) {
+      if (/UNIQUE constraint failed/i.test(String(e && e.message))) {
+        return Response.json({ ok: false, error: "email_taken", message: "该邮箱已分配" }, { status: 409 });
+      }
+      throw e;
+    }
+    if (results[0].meta.changes !== 1) {
+      return Response.json({ ok: false, error: "not_pending", message: "该申请已被处理" }, { status: 409 });
+    }
+    return Response.json({ ok: true, email, secret });
+  }
+
+  return Response.json({ ok: false, error: "not_found" }, { status: 404 });
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -447,55 +589,78 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       return Response.json({ id: row.id, status: row.status, email: row.email || null });
     }
 
-    // 管理页（Cloudflare Access 保护，代码内不鉴权）
-    // 管理页：admin.abot.run/ 或 abot.run/admin（Cloudflare Access 保护）
-    const host = url.hostname;
-    const isAdmin = host === "admin.abot.run" ? (path === "/" || path === "") : (path === "/admin");
-    if (isAdmin && request.method === "GET") {
+    // 管理页只在 admin.abot.run 提供：Cloudflare Access 在边缘拦截，代码内再校验 Access JWT（纵深防御）
+    const isAdminHost = url.hostname === ADMIN_HOST;
+    if (!isAdminHost && (path === "/admin" || path.startsWith("/admin/"))) {
+      return Response.json({ error: "not_found" }, { status: 404 });
+    }
+    if (isAdminHost && ADMIN_POST_PATHS.includes(path) && request.method === "POST") {
       const denied = await requireAccess(request);
       if (denied) return denied;
-      await ensureOAuthTables(env);
-      const rows = await env.DB.prepare(
-        "SELECT id, agent_name, reason, requested_email, status, email, created_at FROM provision_requests ORDER BY created_at DESC LIMIT 50"
-      ).all();
-      // 有效邀请码（未使用、1小时内、有明文）
-      const codes = await env.DB.prepare(
-        `SELECT code, created_at FROM invite_codes WHERE used_at IS NULL AND code IS NOT NULL AND ${isoTime("created_at")} > ${HOUR_AGO} ORDER BY created_at DESC`
-      ).all();
-      const codeItems = (codes.results || []).map((c, i) =>
-        `<div style="display:flex;align-items:center;gap:8px;margin:4px 0">
-          <code id="vc${i}" style="flex:1">${esc(c.code)}</code>
-          <button onclick="navigator.clipboard.writeText(document.getElementById('vc${i}').innerText).then(()=>{this.innerText='已复制✓';setTimeout(()=>this.innerText='复制',1500)})" style="padding:4px 12px;font-size:12px">复制</button>
-          <span style="color:#999;font-size:12px">${esc(c.created_at)}</span>
-        </div>`
-      ).join("");
-      // 已批准的 agent 列表
-      const agents = await env.DB.prepare(
-        "SELECT id, agent_name, email, created_at FROM provision_requests WHERE status='approved' AND email IS NOT NULL ORDER BY created_at DESC"
-      ).all();
-      const agentItems = (agents.results || []).map((a, i) =>
-        `<div class="agent-row" style="display:flex;align-items:center;gap:8px;margin:6px 0;padding:8px;border:1px solid #ddd;border-radius:6px">
-          <div style="flex:1"><b>${esc(a.agent_name) || "(未命名)"}</b><br><code>${esc(a.email)}</code></div>
-          <button data-action="rotate" data-id="${a.id}" style="padding:4px 12px;font-size:12px">换 Secret</button>
-          <button data-action="revoke" data-id="${a.id}" style="padding:4px 12px;font-size:12px;background:#ffebee">吊销</button>
-        </div>`
-      ).join("");
-      const items = (rows.results || []).map((r) =>
-        `<div style="border:1px solid #ddd;border-radius:8px;padding:12px;margin:8px 0">
-          <b>${esc(r.agent_name) || "(未命名)"}</b> <span style="color:#666">${esc(r.id)}</span><br>
-          <span>${esc(r.reason)}</span><br>
-          <span>状态: ${esc(STATUS_LABELS[r.status] || r.status)}</span> <span style="color:#999">${esc(r.created_at)}</span><br>
-          ${r.status === "approved" && r.email ? `<span style="color:#2e7d32">邮箱: ${esc(r.email)}</span><br>` : ""}
-          ${r.status === "revoked" && r.email ? `<span style="color:#c62828">邮箱: ${esc(r.email)}（已吊销）</span><br>` : ""}
-          ${r.status === "pending" ? `
-            <div class="req-row" style="margin-top:8px">
-              ${r.requested_email ? `<span style="color:#666">申请想要：${esc(r.requested_email)}</span><br>` : ""}
-              <button data-action="approve" data-id="${r.id}">通过并建邮箱</button>
-              <button data-action="deny" data-id="${r.id}">拒绝</button>
-            </div>` : ""}
-        </div>`
-      ).join("");
-      return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 审核</title><script>${ADMIN_JS}</script>
+      const csrf = rejectCrossSite(request);
+      if (csrf) return csrf;
+      let body;
+      try { body = await request.json(); } catch { body = null; }
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return Response.json({ ok: false, error: "invalid_json" }, { status: 400, headers: { "Cache-Control": "no-store" } });
+      }
+      let resp;
+      try {
+        await ensureOAuthTables(env);
+        resp = await handleAdminPost(path, body, env);
+      } catch (e) {
+        resp = internalError();
+      }
+      resp.headers.set("Cache-Control", "no-store");
+      return resp;
+    }
+    if (isAdminHost && (path === "/" || path === "") && request.method === "GET") {
+      const denied = await requireAccess(request);
+      if (denied) return denied;
+      try {
+        await ensureOAuthTables(env);
+        const rows = await env.DB.prepare(
+          "SELECT id, agent_name, reason, requested_email, status, email, created_at FROM provision_requests ORDER BY created_at DESC LIMIT 50"
+        ).all();
+        // 有效邀请码（未使用、1小时内、有明文）
+        const codes = await env.DB.prepare(
+          `SELECT code, created_at FROM invite_codes WHERE used_at IS NULL AND code IS NOT NULL AND ${isoTime("created_at")} > ${HOUR_AGO} ORDER BY created_at DESC`
+        ).all();
+        const codeItems = (codes.results || []).map((c, i) =>
+          `<div style="display:flex;align-items:center;gap:8px;margin:4px 0">
+            <code id="vc${i}" style="flex:1">${esc(c.code)}</code>
+            <button data-action="copy" data-target="vc${i}" style="padding:4px 12px;font-size:12px">复制</button>
+            <span style="color:#999;font-size:12px">${esc(c.created_at)}</span>
+          </div>`
+        ).join("");
+        // 已批准的 agent 列表
+        const agents = await env.DB.prepare(
+          "SELECT id, agent_name, email, created_at FROM provision_requests WHERE status='approved' AND email IS NOT NULL ORDER BY created_at DESC"
+        ).all();
+        const agentItems = (agents.results || []).map((a, i) =>
+          `<div class="agent-row" style="display:flex;align-items:center;gap:8px;margin:6px 0;padding:8px;border:1px solid #ddd;border-radius:6px">
+            <div style="flex:1"><b>${esc(a.agent_name) || "(未命名)"}</b><br><code>${esc(a.email)}</code></div>
+            <button data-action="rotate" data-id="${esc(a.id)}" style="padding:4px 12px;font-size:12px">换 Secret</button>
+            <button data-action="revoke" data-id="${esc(a.id)}" style="padding:4px 12px;font-size:12px;background:#ffebee">吊销</button>
+          </div>`
+        ).join("");
+        const nonce = btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))));
+        const items = (rows.results || []).map((r) =>
+          `<div style="border:1px solid #ddd;border-radius:8px;padding:12px;margin:8px 0">
+            <b>${esc(r.agent_name) || "(未命名)"}</b> <span style="color:#666">${esc(r.id)}</span><br>
+            <span>${esc(r.reason)}</span><br>
+            <span>状态: ${esc(STATUS_LABELS[r.status] || r.status)}</span> <span style="color:#999">${esc(r.created_at)}</span><br>
+            ${r.status === "approved" && r.email ? `<span style="color:#2e7d32">邮箱: ${esc(r.email)}</span><br>` : ""}
+            ${r.status === "revoked" && r.email ? `<span style="color:#c62828">邮箱: ${esc(r.email)}（已吊销）</span><br>` : ""}
+            ${r.status === "pending" ? `
+              <div class="req-row" style="margin-top:8px">
+                ${r.requested_email ? `<span style="color:#666">申请想要：${esc(r.requested_email)}</span><br>` : ""}
+                <button data-action="approve" data-id="${esc(r.id)}">通过并建邮箱</button>
+                <button data-action="deny" data-id="${esc(r.id)}">拒绝</button>
+              </div>` : ""}
+          </div>`
+        ).join("");
+        return new Response(`<!doctype html><html><head><meta charset="utf-8"><title>aBot 审核</title><script nonce="${nonce}">${ADMIN_JS}</script>
 <style>body{font-family:system-ui;max-width:640px;margin:40px auto;padding:20px}
 button{padding:8px 20px;margin:4px;font-size:14px;cursor:pointer}
 .newcode{background:#e8f5e9;border:1px solid #4caf50;border-radius:8px;padding:12px;margin:12px 0;word-break:break-all}</style>
@@ -510,135 +675,10 @@ ${codeItems ? `<div style="margin-top:8px"><b>有效邀请码：</b>${codeItems}
 ${agentItems || `<div style="color:#999;margin-top:8px">暂无</div>`}
 </div>
 ${items || "<p>暂无申请</p>"}</body></html>`,
-        { headers: { "Content-Type": "text/html;charset=utf-8" } });
-    }
-
-    const isAdminHost2 = url.hostname === "admin.abot.run";
-    const approvePath = isAdminHost2 ? "/approve" : "/admin/approve";
-    const denyPath = isAdminHost2 ? "/deny" : "/admin/deny";
-    const invitePath = isAdminHost2 ? "/invite" : "/admin/invite";
-    const rotatePath = isAdminHost2 ? "/rotate" : "/admin/rotate";
-    const revokePath = isAdminHost2 ? "/revoke" : "/admin/revoke";
-    // 吊销：申请标记 revoked，secret / token / 授权码全部失效
-    if (path === revokePath && request.method === "POST") {
-      const denied = await requireAccess(request);
-        if (denied) return denied;
-      try {
-        await ensureOAuthTables(env);
-        const body = await request.json();
-        const id = body.id || "";
-        const req = await env.DB.prepare("SELECT email, status FROM provision_requests WHERE id=?").bind(id).first();
-        if (!req || !req.email) return Response.json({ ok: false, error: "not_found" }, { status: 404 });
-        if (req.status !== "approved") {
-          return Response.json({ ok: false, error: "not_approved", message: "该申请当前不是已通过状态" }, { status: 409 });
-        }
-        await env.DB.batch([
-          env.DB.prepare("UPDATE provision_requests SET status='revoked', secret_hash=NULL WHERE id=?").bind(id),
-          env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=? AND revoked_at IS NULL").bind(req.email),
-          env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email),
-          env.DB.prepare("DELETE FROM gw_oauth_codes WHERE email=?").bind(req.email),
-        ]);
-        return Response.json({ ok: true });
-      } catch (e) { return internalError(); }
-    }
-    // 换 Secret：生成新的 ask_，旧的失效（仅限 approved）
-    if (path === rotatePath && request.method === "POST") {
-      const denied = await requireAccess(request);
-        if (denied) return denied;
-      try {
-        await ensureOAuthTables(env);
-        const body = await request.json();
-        const id = body.id || "";
-        const req = await env.DB.prepare("SELECT email FROM provision_requests WHERE id=? AND status='approved'").bind(id).first();
-        if (!req || !req.email) return Response.json({ ok: false, error: "not_found" }, { status: 404 });
-        const secret = "ask_" + [...crypto.getRandomValues(new Uint8Array(18))].map(b => b.toString(16).padStart(2, "0")).join("");
-        const secretHash = await sha256hex(secret);
-        // 新 token 只在申请仍为 approved 时写入，避免与并发吊销交错后复活凭证
-        const results = await env.DB.batch([
-          env.DB.prepare("UPDATE agent_tokens SET revoked_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE email=? AND revoked_at IS NULL").bind(req.email),
-          env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE email=?").bind(req.email),
-          env.DB.prepare("DELETE FROM gw_oauth_codes WHERE email=?").bind(req.email),
-          env.DB.prepare("UPDATE provision_requests SET secret_hash=? WHERE id=? AND status='approved'").bind(secretHash, id),
-          env.DB.prepare("INSERT INTO agent_tokens (token_hash, email, request_id) SELECT ?, email, id FROM provision_requests WHERE id=? AND status='approved' AND email=?").bind(secretHash, id, req.email),
-        ]);
-        if (!results[4] || !results[4].meta || results[4].meta.changes !== 1) {
-          return Response.json({ ok: false, error: "not_approved", message: "该申请已不是已通过状态" }, { status: 409 });
-        }
-        return Response.json({ ok: true, email: req.email, secret });
-      } catch (e) { return internalError(); }
-    }
-    // 生成邀请码（只显示一次）
-    if (path === invitePath && request.method === "POST") {
-      try {
-        const denied = await requireAccess(request);
-        if (denied) return denied;
-        await ensureOAuthTables(env);
-        const code = "inv_" + [...crypto.getRandomValues(new Uint8Array(12))].map(b => b.toString(16).padStart(2, "0")).join("");
-        const hash = await sha256hex(code);
-        await env.DB.prepare("INSERT INTO invite_codes (code_hash, code) VALUES (?,?)").bind(hash, code).run();
-        return Response.json({ ok: true, code });
-      } catch (e) { return internalError(); }
-    }
-    if ((path === approvePath || path === denyPath) && request.method === "POST") {
-      const denied = await requireAccess(request);
-        if (denied) return denied;
-      try {
-      await ensureOAuthTables(env);
-      const body = await request.json();
-      const id = typeof body.id === "string" ? body.id : "";
-      const approve = path === approvePath;
-      if (!approve) {
-        const r = await env.DB.prepare("UPDATE provision_requests SET status='denied' WHERE id=? AND status='pending'").bind(id).run();
-        if (r.meta.changes === 1) return Response.json({ ok: true });
-        const cur = await env.DB.prepare("SELECT status FROM provision_requests WHERE id=?").bind(id).first();
-        if (!cur) return Response.json({ ok: false, error: "not_found", message: "申请不存在" }, { status: 404 });
-        if (cur.status === "approved") {
-          return Response.json({ ok: false, error: "already_approved", message: "已通过的申请不能拒绝，请用「吊销」" }, { status: 409 });
-        }
-        return Response.json({ ok: false, error: "not_pending", message: "该申请已处理（" + cur.status + "）" }, { status: 409 });
-      }
-      // 通过：手动邮箱 + 生成 secret + 建 mailbox 记录
-      const email = normalizeEmail(body.email);
-      if (!email) {
-        return Response.json({ ok: false, error: "invalid_email", message: "邮箱必须是 xxx@abot.run，只能含小写字母、数字和 ._-，首尾为字母或数字" }, { status: 400 });
-      }
-      const cur = await env.DB.prepare("SELECT status FROM provision_requests WHERE id=?").bind(id).first();
-      if (!cur) return Response.json({ ok: false, error: "not_found", message: "申请不存在" }, { status: 404 });
-      if (cur.status !== "pending") {
-        return Response.json({ ok: false, error: "not_pending", message: "该申请已处理（" + cur.status + "）" }, { status: 409 });
-      }
-      // 分配过的邮箱（含已吊销）不再复用，避免新 agent 读到旧邮件
-      const dup = await env.DB.prepare(
-        "SELECT 1 AS x FROM provision_requests WHERE email=? UNION ALL SELECT 1 FROM mailboxes WHERE email=? LIMIT 1"
-      ).bind(email, email).first();
-      if (dup) {
-        return Response.json({ ok: false, error: "email_taken", message: "该邮箱已分配" }, { status: 409 });
-      }
-      const secret = "ask_" + [...crypto.getRandomValues(new Uint8Array(18))].map(b => b.toString(16).padStart(2, "0")).join("");
-      const secretHash = await sha256hex(secret);
-      // 一个事务：只有把 pending 改成 approved 的这次请求才会写 token / mailbox（以本次 secret_hash 为凭）。
-      // 邮箱唯一由 provision_requests 唯一索引和 mailboxes 主键兜底，冲突时整体回滚。
-      let results;
-      try {
-        results = await env.DB.batch([
-          env.DB.prepare("UPDATE provision_requests SET status='approved', email=?, secret_hash=? WHERE id=? AND status='pending'")
-            .bind(email, secretHash, id),
-          env.DB.prepare("INSERT INTO agent_tokens (token_hash, email, request_id) SELECT secret_hash, email, id FROM provision_requests WHERE id=? AND status='approved' AND secret_hash=?")
-            .bind(id, secretHash),
-          env.DB.prepare("INSERT INTO mailboxes (email, request_id) SELECT email, id FROM provision_requests WHERE id=? AND status='approved' AND secret_hash=?")
-            .bind(id, secretHash),
-        ]);
+          { headers: adminPageHeaders(nonce) });
       } catch (e) {
-        if (/UNIQUE constraint failed/i.test(String(e && e.message))) {
-          return Response.json({ ok: false, error: "email_taken", message: "该邮箱已分配" }, { status: 409 });
-        }
-        throw e;
+        return internalError();
       }
-      if (results[0].meta.changes !== 1) {
-        return Response.json({ ok: false, error: "not_pending", message: "该申请已被处理" }, { status: 409 });
-      }
-      return Response.json({ ok: true, email, secret });
-      } catch (e) { return internalError(); }
     }
 
     // ---- 以下为 MCP 代理（需鉴权） ----

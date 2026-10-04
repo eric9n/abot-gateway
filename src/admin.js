@@ -1,5 +1,6 @@
 // Admin 页面交互逻辑
-// 使用 data-action 和 data-id 属性，不用内联 onclick
+// 使用 data-action 和 data-id 属性，不用内联 onclick（页面 CSP 只放行带 nonce 的脚本）
+// 请求路径用绝对路径，管理页只在 admin.abot.run/ 提供
 
 function postJSON(path, data) {
   return fetch(path, {
@@ -77,7 +78,7 @@ document.addEventListener('DOMContentLoaded', function() {
     btn.addEventListener('click', function() {
       var id = btn.getAttribute('data-id');
       var container = btn.closest('.agent-row');
-      postJSON('rotate', {id: id}).then(function(r) {
+      postJSON('/rotate', {id: id}).then(function(r) {
         showSecret(container, r.secret);
       }).catch(reportFail);
     });
@@ -87,17 +88,29 @@ document.addEventListener('DOMContentLoaded', function() {
   document.querySelectorAll('[data-action="revoke"]').forEach(function(btn) {
     btn.addEventListener('click', function() {
       var id = btn.getAttribute('data-id');
-      postJSON('revoke', {id: id}).then(function() {
+      postJSON('/revoke', {id: id}).then(function() {
         location.reload();
       }).catch(reportFail);
     });
   });
   
+  // 复制有效邀请码
+  document.querySelectorAll('[data-action="copy"]').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var target = document.getElementById(btn.getAttribute('data-target'));
+      if (!target) return;
+      navigator.clipboard.writeText(target.textContent).then(function() {
+        btn.textContent = '已复制✓';
+        setTimeout(function() { btn.textContent = '复制'; }, 1500);
+      }).catch(reportFail);
+    });
+  });
+
   // 生成邀请码
   var inviteBtn = document.querySelector('[data-action="invite"]');
   if (inviteBtn) {
     inviteBtn.addEventListener('click', function() {
-      postJSON('invite', {}).then(function(r) {
+      postJSON('/invite', {}).then(function(r) {
         showCode(r.code);
       }).catch(reportFail);
     });
@@ -110,7 +123,7 @@ document.addEventListener('DOMContentLoaded', function() {
       var email = prompt('输入邮箱 (xxx@abot.run):');
       if (!email) return;
       var container = btn.closest('.req-row');
-      postJSON('approve', {id: id, email: email}).then(function(r) {
+      postJSON('/approve', {id: id, email: email}).then(function(r) {
         showSecret(container, r.secret);
       }).catch(reportFail);
     });
@@ -120,7 +133,7 @@ document.addEventListener('DOMContentLoaded', function() {
   document.querySelectorAll('[data-action="deny"]').forEach(function(btn) {
     btn.addEventListener('click', function() {
       var id = btn.getAttribute('data-id');
-      postJSON('deny', {id: id}).then(function() {
+      postJSON('/deny', {id: id}).then(function() {
         location.reload();
       }).catch(reportFail);
     });

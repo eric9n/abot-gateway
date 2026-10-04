@@ -37,7 +37,7 @@ console.log('3b. 构建后 admin.js 必须嵌进页面...');
     console.error('   ✗ dist 仍是未构建的 admin 占位');
     process.exit(1);
   }
-  if (!dist.includes("postJSON('invite'") || !dist.includes('data-action="invite"')) {
+  if (!dist.includes("postJSON('/invite'") || !dist.includes('data-action="invite"')) {
     console.error('   ✗ dist 缺少生成邀请码的脚本');
     process.exit(1);
   }
@@ -623,6 +623,76 @@ try {
     if (!rejected) fail('admin.js 含 </script 时构建应失败');
   }
   console.log('   ✓ 构建嵌入正确');
+
+  console.log('11i. admin 只在 admin.abot.run，POST 需 Access + 同源 JSON...');
+  {
+    const expect = async (resp, status, label, error) => {
+      const text = await resp.text();
+      if (resp.status !== status) fail(label + ': 期望 ' + status + '，实际 ' + resp.status + ' ' + text.slice(0, 120));
+      if (error && !text.includes(error)) fail(label + ': 期望 ' + error + '，实际 ' + text.slice(0, 120));
+    };
+    await expect(await adminPost('/invite', {}, { jwt: null }), 403, '无 JWT');
+    await expect(await adminPost('/invite', {}, { jwt: await ak.sign(ak.claims({ aud: ['05d351ef-e796-4e3e-a6f4-bbcc30b98941'] })) }), 403, '错误 aud');
+    await expect(await adminPost('/invite', '{}', { headers: { 'Content-Type': 'text/plain' } }), 403, 'text/plain', 'csrf_rejected');
+    await expect(await adminPost('/invite', '{}', { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }), 403, '表单类型', 'csrf_rejected');
+    await expect(await adminPost('/invite', {}, { headers: { Origin: 'https://evil.example', 'Sec-Fetch-Site': 'cross-site' } }), 403, '跨站 Origin', 'csrf_rejected');
+    await expect(await adminPost('/invite', {}, { headers: { Origin: 'https://abot.run' } }), 403, 'abot.run Origin', 'csrf_rejected');
+    await expect(await adminPost('/invite', {}, { headers: { Origin: 'null' } }), 403, 'Origin null', 'csrf_rejected');
+    await expect(await adminPost('/invite', {}, { headers: { Origin: null } }), 403, '无 Origin 无 Sec-Fetch-Site', 'csrf_rejected');
+    await expect(await adminPost('/invite', {}, { headers: { Origin: null, 'Sec-Fetch-Site': 'cross-site' } }), 403, '无 Origin 跨站', 'csrf_rejected');
+    await expect(await adminPost('/invite', {}, { headers: { Origin: null, 'Sec-Fetch-Site': 'same-origin' } }), 200, '无 Origin 但 same-origin');
+    await expect(await adminPost('/invite', {}, { headers: { 'Content-Type': 'application/json; charset=utf-8' } }), 200, '带 charset 的 JSON');
+    const pid = await newRequest();
+    await expect(await adminPost('/deny', JSON.stringify({ id: pid }), { headers: { 'Content-Type': 'text/plain', Origin: 'https://evil.example' } }), 403, '跨站 text/plain deny');
+    if (q1('SELECT status FROM provision_requests WHERE id=?', pid).status !== 'pending') fail('被拒的 CSRF 请求不应改状态');
+
+    await expect(await adminPost('/approve', '{not json'), 400, '坏 JSON', 'invalid_json');
+    await expect(await adminPost('/approve', '[1]'), 400, 'JSON 数组', 'invalid_json');
+    const inv = await adminPost('/invite', {});
+    if (inv.headers.get('cache-control') !== 'no-store') fail('admin POST 响应应 no-store（含 secret / 邀请码）');
+
+    await expect(await adminGet({ host: 'https://abot.run', path: '/admin' }), 404, 'abot.run/admin 不再是管理页');
+    await expect(await adminPost('/admin/invite', {}, { host: 'https://abot.run', headers: { Origin: 'https://abot.run' } }), 404, 'abot.run/admin/invite');
+    await expect(await adminGet({ host: 'https://abot-gateway.example.workers.dev', path: '/admin' }), 404, '其它 host 的 /admin');
+    await expect(await adminPost('/invite', {}, { host: 'https://abot.run', headers: { Origin: 'https://abot.run' } }), 401, 'abot.run/invite 不是管理接口');
+    await expect(await adminGet({ path: '/admin' }), 401, 'admin.abot.run/admin 不是管理页');
+  }
+  console.log('   ✓ admin 入口与 CSRF 校验正确');
+
+  console.log('11j. admin 页安全头、CSP nonce、属性转义、异常处理...');
+  {
+    const evilId = 'x"><img src=x onerror=alert(1)>';
+    D1.raw.prepare("INSERT INTO provision_requests (id, agent_name, status, created_at) VALUES (?, '<b>n</b>', 'pending', strftime('%Y-%m-%dT%H:%M:%fZ','now'))").run(evilId);
+    const page = await adminGet();
+    const html = await page.text();
+    const h = (k) => page.headers.get(k) || '';
+    const csp = h('content-security-policy');
+    const nonce = (csp.match(/script-src 'nonce-([^']+)'/) || [])[1];
+    if (!nonce) fail('CSP 应用 nonce 放行脚本: ' + csp);
+    if (/script-src[^;]*unsafe-inline/.test(csp)) fail('script-src 不应有 unsafe-inline');
+    for (const d of ["default-src 'none'", "style-src 'unsafe-inline'", "connect-src 'self'", "frame-ancestors 'none'", "base-uri 'none'", "form-action 'self'"]) {
+      if (!csp.includes(d)) fail('CSP 缺少 ' + d);
+    }
+    if (!html.includes('<script nonce="' + nonce + '">')) fail('脚本标签应带同一个 nonce');
+    if ((html.match(/<script/g) || []).length !== 1) fail('页面只应有一个脚本');
+    const markup = html.replace(/<script[\s\S]*?<\/script>/, '').split('x&quot;&gt;&lt;img src=x onerror=alert(1)&gt;').join('');
+    if (/\son[a-z]+=/i.test(markup)) fail('页面不应有内联事件处理器');
+    if (h('x-frame-options') !== 'DENY' || h('cache-control') !== 'no-store' || h('referrer-policy') !== 'no-referrer') fail('缺少安全头');
+    const page2 = await adminGet();
+    if ((page2.headers.get('content-security-policy') || '').includes(nonce)) fail('每次响应应生成新 nonce');
+    if (html.includes(evilId) || html.includes('<img')) fail('data-id / 文本未转义');
+    if (!html.includes('data-id="x&quot;&gt;&lt;img src=x onerror=alert(1)&gt;"')) fail('data-id 应 HTML 转义');
+    D1.raw.prepare('DELETE FROM provision_requests WHERE id=?').run(evilId);
+
+    const broken = { DB: { prepare() { const st = { bind() { return st; }, async first() { throw new Error('D1_ERROR secret detail'); }, async all() { throw new Error('D1_ERROR secret detail'); }, async run() { throw new Error('D1_ERROR secret detail'); } }; return st; }, async batch() { throw new Error('D1_ERROR secret detail'); } } };
+    const g = await built.fetch(new Request(ADMIN + '/', { headers: { 'Cf-Access-Jwt-Assertion': J } }), broken);
+    const gt = await g.text();
+    if (g.status !== 500 || gt.includes('secret detail') || !gt.includes('internal_error')) fail('admin GET 出错应返回通用 500: ' + g.status + ' ' + gt);
+    const pp = await built.fetch(new Request(ADMIN + '/approve', { method: 'POST', headers: { 'Cf-Access-Jwt-Assertion': J, 'Content-Type': 'application/json', Origin: ADMIN }, body: '{"id":"x","email":"a@abot.run"}' }), broken);
+    const ppt = await pp.text();
+    if (pp.status !== 500 || ppt.includes('secret detail')) fail('admin POST 出错应返回通用 500: ' + pp.status + ' ' + ppt);
+  }
+  console.log('   ✓ admin 页安全头与异常处理正确');
 } finally {
   globalThis.fetch = savedFetch;
 }
