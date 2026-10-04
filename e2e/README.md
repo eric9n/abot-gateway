@@ -12,8 +12,8 @@ Mock 的 Worker 名与线上一致（`abot-data`、`resend-agent-mail-relay`、`
 
 本环境没有 Cloudflare 凭证，下面几步这里做不了：
 
-1. 把网关部署到 staging。仓库里没有可直接 deploy 的根目录 `wrangler.toml`，合并到 `main` 才会走 CI 部署。
-2. 在线上网关的配置里加上同样的 6 个 service binding，指向**已经部署的真实 Worker**，并保留现有 D1 `DB`。名字见 `wrangler.toml.example`。本地 mock 不能代替这一步。
+1. 把网关部署到 staging。根目录 `wrangler.toml` 是生产配置（生产路由和 D1），不要拿来部署 staging；合并到 `main` 会走 CI 部署到生产。
+2. 在线上网关的配置里加上同样的 6 个 service binding，指向**已经部署的真实 Worker**，并保留现有 D1 `DB`。名字见根目录 `wrangler.toml`。本地 mock 不能代替这一步。
 3. 确认 6 个真实后端接受 Service Binding 请求，并且不再强制校验 `X-Internal-Token`。后端如果还在验 token，staging 上的转发会失败，即使本地 e2e 是通过的。
 4. 用 Cloudflare Access 打开 `https://admin.abot.run`，走真实的邀请码审核拿到 agent secret。本地脚本是直接往本地 D1 插了一行 `agent_tokens`，绕过了 Access。
 5. 用这个真实 secret 对 staging 再走一遍：注册 OAuth client、授权码换 token，然后请求 `/data/`、`/mail/`、`/health/`、`/rules/`、`/secrets/`、`/sms/`，核对后端收到的路径和 `X-Abot-Owner-Email`。

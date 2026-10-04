@@ -100,6 +100,25 @@ for (const s of ['backend_unavailable', 'X-Abot-Owner-Email', 'serviceBinding(',
 }
 console.log('   ✓ Service Binding 映射齐全');
 
+console.log('7b. wrangler.toml 与代码一致（部署构建产物、binding、路由）...');
+{
+  const toml = readFileSync('wrangler.toml', 'utf8');
+  const need = [
+    'name = "abot-gateway"', 'main = "dist/worker.js"', 'workers_dev = false', 'command = "node build.js"',
+    'binding = "DB"', 'database_id = "bb648d2d-e0e6-4d42-87ea-ed2e50cfcc3f"',
+    '{ pattern = "admin.abot.run/*", zone_name = "abot.run" }', '{ pattern = "abot.run/*", zone_name = "abot.run" }',
+  ];
+  for (const n of need) if (!toml.includes(n)) { console.error('   ✗ wrangler.toml 缺少 ' + n); process.exit(1); }
+  const routed = [...workerSrc.matchAll(/"\/[a-z]+\/": "(BACKEND_[A-Z]+)"/g)].map((m) => m[1]);
+  if (routed.length !== 6) { console.error('   ✗ ROUTES 应有 6 个后端，实际 ' + routed.length); process.exit(1); }
+  for (const b of routed) if (!toml.includes(`binding = "${b}"`)) { console.error('   ✗ wrangler.toml 缺少 binding ' + b); process.exit(1); }
+  const ci = readFileSync('.github/workflows/ci.yml', 'utf8');
+  if (!ci.includes('deploy --config wrangler.toml') || ci.indexOf('node build.js', ci.indexOf('deploy:')) < 0) {
+    console.error('   ✗ CI 部署应先构建再用 wrangler.toml'); process.exit(1);
+  }
+}
+console.log('   ✓ wrangler.toml 一致');
+
 function fail(msg) {
   console.error('   ✗ ' + msg);
   process.exit(1);

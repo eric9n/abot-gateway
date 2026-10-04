@@ -1,0 +1,50 @@
+# 线上 abot-gateway 的完整部署配置，与 Cloudflare 上 Worker 的 settings 一致（bindings、D1、路由、兼容日期）。
+# CI 在 main 上先 node build.js，再用本文件 wrangler deploy。只部署构建产物 dist/worker.js（admin.js 已嵌入）。
+#
+# 线上另有 secret（值不在仓库里，wrangler deploy 会保留）：
+#   INTERNAL_DATA, INTERNAL_HEALTH, INTERNAL_MAIL, INTERNAL_RULES, INTERNAL_SECRETS
+# 网关代码已不读取它们；确认后端不再校验 X-Internal-Token 后可以 wrangler secret delete。
+
+name = "abot-gateway"
+main = "dist/worker.js"
+compatibility_date = "2026-09-01"
+workers_dev = false
+preview_urls = false
+
+routes = [
+  { pattern = "admin.abot.run/*", zone_name = "abot.run" },
+  { pattern = "abot.run/*", zone_name = "abot.run" },
+]
+
+[build]
+command = "node build.js"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "abot-data"
+database_id = "bb648d2d-e0e6-4d42-87ea-ed2e50cfcc3f"
+
+# 网关与这些后端必须在同一个 Cloudflare 账号；service 是 Worker 脚本名
+[[services]]
+binding = "BACKEND_DATA"
+service = "abot-data"
+
+[[services]]
+binding = "BACKEND_MAIL"
+service = "resend-agent-mail-relay"
+
+[[services]]
+binding = "BACKEND_HEALTH"
+service = "abot-health"
+
+[[services]]
+binding = "BACKEND_RULES"
+service = "abot-rules"
+
+[[services]]
+binding = "BACKEND_SECRETS"
+service = "abot-secrets"
+
+[[services]]
+binding = "BACKEND_SMS"
+service = "abot-sms"
