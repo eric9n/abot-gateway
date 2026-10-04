@@ -367,7 +367,14 @@ const signup = (code, extra = {}) => call('https://abot-gateway/provision/reques
   body: JSON.stringify({ invite_code: code, agent_name: 'bot', reason: 'test', ...extra }),
 });
 const newCode = async () => (await (await adminPost('/invite', {})).json()).code;
-const newRequest = async () => (await (await signup(await newCode())).json()).id;
+// 全局限流 10 次/小时：造数据前把已有申请挪到窗口外
+const ageRequests = () => D1.raw.exec("UPDATE provision_requests SET created_at='2000-01-01T00:00:00.000Z'");
+async function newRequest() {
+  ageRequests();
+  const body = await (await signup(await newCode())).json();
+  if (!body.id) fail('造申请失败: ' + JSON.stringify(body));
+  return body.id;
+}
 async function approveNew(email) {
   const id = await newRequest();
   const r = await adminPost('/approve', { id, email });
@@ -440,6 +447,79 @@ try {
     if (q1("SELECT COUNT(*) c FROM agent_tokens WHERE email='rotate@abot.run' AND revoked_at IS NULL").c !== 1) fail('换 Secret 后只应有一个有效 token');
   }
   console.log('   ✓ 换 Secret 行为正确');
+
+  console.log('11c. approve / deny 校验申请存在且为 pending...');
+  {
+    const ghost = await adminPost('/approve', { id: 'does_not_exist', email: 'ghost@abot.run' });
+    const ghostBody = await ghost.json();
+    if (ghost.status !== 404 || ghostBody.ok !== false) fail('approve 不存在的申请应 404 ok:false，实际 ' + ghost.status + ' ' + JSON.stringify(ghostBody));
+    if (q1("SELECT COUNT(*) c FROM agent_tokens WHERE email='ghost@abot.run'").c !== 0) fail('approve 不存在的申请不应写 agent_tokens');
+    if (q1("SELECT COUNT(*) c FROM mailboxes WHERE email='ghost@abot.run'").c !== 0) fail('approve 不存在的申请不应建 mailbox');
+
+    const { id, body: first } = await approveNew('twice@abot.run');
+    if (!first.ok) fail('首次 approve 应成功');
+    const second = await adminPost('/approve', { id, email: 'twice2@abot.run' });
+    if (second.status !== 409) fail('重复 approve 应 409，实际 ' + second.status);
+    if (q1("SELECT COUNT(*) c FROM agent_tokens WHERE email='twice2@abot.run'").c !== 0) fail('重复 approve 不应发新凭证');
+    if (q1('SELECT email FROM provision_requests WHERE id=?', id).email !== 'twice@abot.run') fail('重复 approve 不应改邮箱');
+
+    const dn = await adminPost('/deny', { id });
+    const dnBody = await dn.json();
+    if (dn.status !== 409 || dnBody.error !== 'already_approved' || !String(dnBody.message).includes('吊销')) {
+      fail('拒绝已通过的申请应 409 并提示用吊销: ' + dn.status + ' ' + JSON.stringify(dnBody));
+    }
+    if (q1('SELECT status FROM provision_requests WHERE id=?', id).status !== 'approved') fail('deny 不应改已通过的状态');
+    if ((await adminPost('/deny', { id: 'nope' })).status !== 404) fail('deny 不存在的申请应 404');
+
+    const pid = await newRequest();
+    if ((await adminPost('/deny', { id: pid })).status !== 200) fail('deny pending 应成功');
+    if ((await adminPost('/approve', { id: pid, email: 'late@abot.run' })).status !== 409) fail('已拒绝的申请不能再 approve');
+
+    // 同一申请并发 approve：只有一个成功，只发一份凭证
+    const rid = await newRequest();
+    const rs = await Promise.all([
+      adminPost('/approve', { id: rid, email: 'race-a@abot.run' }),
+      adminPost('/approve', { id: rid, email: 'race-b@abot.run' }),
+    ]);
+    if (rs.filter((r) => r.status === 200).length !== 1) fail('并发 approve 应只有一个成功: ' + rs.map((r) => r.status));
+    if (q1("SELECT COUNT(*) c FROM agent_tokens WHERE request_id=?", rid).c !== 1) fail('并发 approve 只应写一个 agent_token');
+  }
+  console.log('   ✓ approve / deny 状态校验正确');
+
+  console.log('11d. 邮箱规范化、格式与唯一性...');
+  {
+    const bad = ['a@b@abot.run', '@abot.run', 'a b@abot.run', 'x@evil.com,y@abot.run', 'x@evil.com', '.a@abot.run',
+      'a.@abot.run', 'a..b@abot.run', 'a@abot.run.evil.com', 'a\nb@abot.run', 'ä@abot.run', 'a+b@abot.run', 'x'.repeat(65) + '@abot.run', 123];
+    for (const email of bad) {
+      const id = await newRequest();
+      const r = await adminPost('/approve', { id, email });
+      const b = await r.json();
+      if (r.status !== 400 || b.error !== 'invalid_email') fail('非法邮箱应拒绝: ' + JSON.stringify(email) + ' → ' + r.status);
+      if (q1('SELECT status FROM provision_requests WHERE id=?', id).status !== 'pending') fail('非法邮箱不应改状态');
+    }
+    const ok = await approveNew('  Mixed.Case_1-x@ABOT.run ');
+    if (!ok.body.ok || ok.body.email !== 'mixed.case_1-x@abot.run') fail('邮箱应 trim + 小写: ' + JSON.stringify(ok.body));
+
+    const taken = await approveNew('MIXED.case_1-x@abot.run');
+    if (taken.status !== 409 || taken.body.error !== 'email_taken') fail('重复邮箱应 email_taken: ' + JSON.stringify(taken.body));
+    // 已吊销的邮箱也不复用
+    const reused = await approveNew('revokeme@abot.run');
+    if (reused.body.error !== 'email_taken') fail('已吊销的邮箱不应分配给新申请');
+
+    // 两个申请并发抢同一邮箱：唯一索引兜底，只有一个成功
+    const [i1, i2] = [await newRequest(), await newRequest()];
+    const rs = await Promise.all([
+      adminPost('/approve', { id: i1, email: 'same@abot.run' }),
+      adminPost('/approve', { id: i2, email: 'same@abot.run' }),
+    ]);
+    const bodies = await Promise.all(rs.map((r) => r.json()));
+    if (bodies.filter((b) => b.ok).length !== 1 || !bodies.some((b) => b.error === 'email_taken')) {
+      fail('并发分配同一邮箱应只有一个成功: ' + JSON.stringify(bodies));
+    }
+    if (q1("SELECT COUNT(*) c FROM agent_tokens WHERE email='same@abot.run'").c !== 1) fail('同一邮箱只应有一个 token');
+    if (q1("SELECT COUNT(*) c FROM provision_requests WHERE email='same@abot.run'").c !== 1) fail('失败的一方应整体回滚');
+  }
+  console.log('   ✓ 邮箱校验正确');
 } finally {
   globalThis.fetch = savedFetch;
 }

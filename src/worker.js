@@ -70,12 +70,27 @@ async function ensureOAuthTables(env) {
     token_hash TEXT PRIMARY KEY, email TEXT NOT NULL, request_id TEXT,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     revoked_at TEXT)`).run();
+  // mail 服务读这张表做隔离
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS mailboxes (
+    email TEXT PRIMARY KEY, request_id TEXT, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
   // 老表补列
   try { await env.DB.prepare("ALTER TABLE invite_codes ADD COLUMN code TEXT").run(); } catch {}
+  // 一个邮箱只分配给一个申请（含已吊销）；已有重复数据时建索引会失败，不阻塞其它功能
+  try { await env.DB.prepare("CREATE UNIQUE INDEX IF NOT EXISTS idx_provision_requests_email ON provision_requests(email) WHERE email IS NOT NULL").run(); } catch {}
   // 懒清理：过期 code / token
   try { await env.DB.prepare("DELETE FROM gw_oauth_codes WHERE expires_at < ?").bind(Date.now()).run(); } catch {}
   try { await env.DB.prepare("DELETE FROM gw_oauth_tokens WHERE created_at < ?").bind(Date.now() - 365 * 24 * 3600 * 1000).run(); } catch {}
   schemaReady = true;
+}
+
+const EMAIL_RE = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?@abot\.run$/;
+
+// 返回规范化后的 agent 邮箱，不合法返回 null
+function normalizeEmail(v) {
+  if (typeof v !== "string") return null;
+  const email = v.trim().toLowerCase();
+  if (!EMAIL_RE.test(email) || email.includes("..")) return null;
+  return email;
 }
 
 async function sha256hex(s) {
@@ -558,33 +573,58 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       try {
       await ensureOAuthTables(env);
       const body = await request.json();
-      const id = body.id || "";
+      const id = typeof body.id === "string" ? body.id : "";
       const approve = path === approvePath;
       if (!approve) {
-        await env.DB.prepare("UPDATE provision_requests SET status='denied' WHERE id=?").bind(id).run();
-        return Response.json({ ok: true });
+        const r = await env.DB.prepare("UPDATE provision_requests SET status='denied' WHERE id=? AND status='pending'").bind(id).run();
+        if (r.meta.changes === 1) return Response.json({ ok: true });
+        const cur = await env.DB.prepare("SELECT status FROM provision_requests WHERE id=?").bind(id).first();
+        if (!cur) return Response.json({ ok: false, error: "not_found", message: "申请不存在" }, { status: 404 });
+        if (cur.status === "approved") {
+          return Response.json({ ok: false, error: "already_approved", message: "已通过的申请不能拒绝，请用「吊销」" }, { status: 409 });
+        }
+        return Response.json({ ok: false, error: "not_pending", message: "该申请已处理（" + cur.status + "）" }, { status: 409 });
       }
       // 通过：手动邮箱 + 生成 secret + 建 mailbox 记录
-      const email = (body.email || "").trim().toLowerCase();
-      if (!email || !email.endsWith("@abot.run")) {
-        return Response.json({ error: "invalid_email", message: "邮箱必须是 xxx@abot.run" }, { status: 400 });
+      const email = normalizeEmail(body.email);
+      if (!email) {
+        return Response.json({ ok: false, error: "invalid_email", message: "邮箱必须是 xxx@abot.run，只能含小写字母、数字和 ._-，首尾为字母或数字" }, { status: 400 });
       }
-      // 邮箱不能重复
-      const dup = await env.DB.prepare("SELECT id FROM provision_requests WHERE email=? AND status='approved'").bind(email).first();
+      const cur = await env.DB.prepare("SELECT status FROM provision_requests WHERE id=?").bind(id).first();
+      if (!cur) return Response.json({ ok: false, error: "not_found", message: "申请不存在" }, { status: 404 });
+      if (cur.status !== "pending") {
+        return Response.json({ ok: false, error: "not_pending", message: "该申请已处理（" + cur.status + "）" }, { status: 409 });
+      }
+      // 分配过的邮箱（含已吊销）不再复用，避免新 agent 读到旧邮件
+      const dup = await env.DB.prepare(
+        "SELECT 1 AS x FROM provision_requests WHERE email=? UNION ALL SELECT 1 FROM mailboxes WHERE email=? LIMIT 1"
+      ).bind(email, email).first();
       if (dup) {
-        return Response.json({ error: "email_taken", message: "该邮箱已分配" }, { status: 400 });
+        return Response.json({ ok: false, error: "email_taken", message: "该邮箱已分配" }, { status: 409 });
       }
       const secret = "ask_" + [...crypto.getRandomValues(new Uint8Array(18))].map(b => b.toString(16).padStart(2, "0")).join("");
       const secretHash = await sha256hex(secret);
-      await env.DB.prepare("UPDATE provision_requests SET status='approved', email=?, secret_hash=? WHERE id=?")
-        .bind(email, secretHash, id).run();
-      // 同步到权限表（网关 MCP 鉴权查这张）
-      await env.DB.prepare("INSERT OR REPLACE INTO agent_tokens (token_hash, email, request_id) VALUES (?,?,?)")
-        .bind(secretHash, email, id).run();
-      // 建 mailbox 记录（mail 服务读这张表做隔离）
-      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS mailboxes (
-        email TEXT PRIMARY KEY, request_id TEXT, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')))`).run();
-      await env.DB.prepare("INSERT OR IGNORE INTO mailboxes (email, request_id) VALUES (?,?)").bind(email, id).run();
+      // 一个事务：只有把 pending 改成 approved 的这次请求才会写 token / mailbox（以本次 secret_hash 为凭）。
+      // 邮箱唯一由 provision_requests 唯一索引和 mailboxes 主键兜底，冲突时整体回滚。
+      let results;
+      try {
+        results = await env.DB.batch([
+          env.DB.prepare("UPDATE provision_requests SET status='approved', email=?, secret_hash=? WHERE id=? AND status='pending'")
+            .bind(email, secretHash, id),
+          env.DB.prepare("INSERT INTO agent_tokens (token_hash, email, request_id) SELECT secret_hash, email, id FROM provision_requests WHERE id=? AND status='approved' AND secret_hash=?")
+            .bind(id, secretHash),
+          env.DB.prepare("INSERT INTO mailboxes (email, request_id) SELECT email, id FROM provision_requests WHERE id=? AND status='approved' AND secret_hash=?")
+            .bind(id, secretHash),
+        ]);
+      } catch (e) {
+        if (/UNIQUE constraint failed/i.test(String(e && e.message))) {
+          return Response.json({ ok: false, error: "email_taken", message: "该邮箱已分配" }, { status: 409 });
+        }
+        throw e;
+      }
+      if (results[0].meta.changes !== 1) {
+        return Response.json({ ok: false, error: "not_pending", message: "该申请已被处理" }, { status: 409 });
+      }
       return Response.json({ ok: true, email, secret });
       } catch (e) { return internalError(); }
     }
