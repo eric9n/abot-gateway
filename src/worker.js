@@ -94,13 +94,14 @@ async function ensureOAuthTables(env) {
   schemaReady = true;
 }
 
-const EMAIL_RE = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?@abot\.run$/;
+// 任意域名（不再限定 @abot.run）：本地部分小写字母数字 ._-，首尾字母数字；域名为合法 label，顶级域至少 2 个字母
+const EMAIL_RE = /^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?@(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 
 // 返回规范化后的 agent 邮箱，不合法返回 null
 function normalizeEmail(v) {
   if (typeof v !== "string") return null;
   const email = v.trim().toLowerCase();
-  if (!EMAIL_RE.test(email) || email.includes("..")) return null;
+  if (email.length > 254 || !EMAIL_RE.test(email) || email.includes("..")) return null;
   return email;
 }
 
@@ -113,7 +114,7 @@ const SIGNUP_INFO = {
   service: "aBot 账户与权限申请",
   steps: [
     "向你的主人要一个邀请码（一小时有效，一次性）",
-    "想一个你想要的邮箱地址，必须是 xxx@abot.run 格式",
+    "想一个你想要的邮箱地址（任意域名的合法邮箱，如 mybot@abot.run）",
     "POST https://abot.run/signup 提交申请",
     "提交后拿到申请 id，可用 GET https://abot.run/provision/status?id=<申请 id> 查进度",
     "审核通过后，主人会把邮箱和 secret（ask_...）发给你",
@@ -330,7 +331,7 @@ async function handleAdminPost(path, body, env) {
     // 通过：手动邮箱 + 生成 secret + 建 mailbox 记录
     const email = normalizeEmail(body.email);
     if (!email) {
-      return Response.json({ ok: false, error: "invalid_email", message: "邮箱必须是 xxx@abot.run，只能含小写字母、数字和 ._-，首尾为字母或数字" }, { status: 400 });
+      return Response.json({ ok: false, error: "invalid_email", message: "邮箱格式不合法：本地部分只能含小写字母、数字和 ._-，首尾为字母或数字，域名需合法" }, { status: 400 });
     }
     const cur = await env.DB.prepare("SELECT status FROM provision_requests WHERE id=?").bind(id).first();
     if (!cur) return Response.json({ ok: false, error: "not_found", message: "申请不存在" }, { status: 404 });
@@ -605,11 +606,11 @@ button{background:#0066ff;color:#fff;border:0;padding:12px 32px;font-size:16px;b
       if (!inviteCode) {
         return Response.json({ error: "invite_code_required", message: "需要邀请码才能申请" }, { status: 400 });
       }
-      // 填了就必须合法（与审批用同一个 EMAIL_RE），在占用邀请码之前拒绝
+      // 填了就必须合法（与审批用同一个 EMAIL_RE，任意域名），在占用邀请码之前拒绝
       const rawEmail = typeof body.requested_email === "string" ? body.requested_email.trim() : "";
       const requestedEmail = rawEmail ? normalizeEmail(rawEmail) : null;
       if (rawEmail && !requestedEmail) {
-        return Response.json({ error: "invalid_email", message: "邮箱必须是 xxx@abot.run，只含小写字母、数字、._-" }, { status: 400 });
+        return Response.json({ error: "invalid_email", message: "邮箱格式不合法：本地部分只含小写字母、数字、._-，域名需合法" }, { status: 400 });
       }
       const codeHash = await sha256hex(inviteCode);
       const id = newId("prov");

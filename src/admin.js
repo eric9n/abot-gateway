@@ -120,7 +120,7 @@ document.addEventListener('DOMContentLoaded', function() {
   document.querySelectorAll('[data-action="approve"]').forEach(function(btn) {
     btn.addEventListener('click', function() {
       var id = btn.getAttribute('data-id');
-      var email = prompt('输入邮箱 (xxx@abot.run):');
+      var email = prompt('输入邮箱（任意域名，如 xxx@abot.run）:');
       if (!email) return;
       var container = btn.closest('.req-row');
       postJSON('/approve', {id: id, email: email}).then(function(r) {

@@ -508,10 +508,17 @@ try {
   }
   console.log('   ✓ approve / deny 状态校验正确');
 
+  console.log('11c2. 任意域名邮箱可审批（不再限定 @abot.run）...');
+  for (const email of ['bot@gmail.com', 'A.Bot@Example.co.uk']) {
+    const id = await newRequest();
+    const r = await adminPost('/approve', { id, email });
+    if (r.status !== 200) fail('任意域名合法邮箱应能审批: ' + email + ' → ' + r.status);
+  }
+
   console.log('11d. 邮箱规范化、格式与唯一性...');
   {
-    const bad = ['a@b@abot.run', '@abot.run', 'a b@abot.run', 'x@evil.com,y@abot.run', 'x@evil.com', '.a@abot.run',
-      'a.@abot.run', 'a..b@abot.run', 'a@abot.run.evil.com', 'a\nb@abot.run', 'ä@abot.run', 'a+b@abot.run', 'x'.repeat(65) + '@abot.run', 123];
+    const bad = ['a@b@abot.run', '@abot.run', 'a b@abot.run', 'x@evil.com,y@abot.run', 'x@evil', 'x@-evil.com', 'x@evil.c0m', '.a@abot.run',
+      'a.@abot.run', 'a..b@abot.run', 'a@abot..run', 'a\nb@abot.run', 'ä@abot.run', 'a+b@abot.run', 'x'.repeat(65) + '@abot.run', 123];
     for (const email of bad) {
       const id = await newRequest();
       const r = await adminPost('/approve', { id, email });
@@ -803,7 +810,7 @@ try {
     }
 
     for (const path of ['/signup', '/provision/request']) {
-      for (const email of ['x@evil.com', 'A@abot.run.evil', 'a..b@abot.run']) {
+      for (const email of ['x@evil', 'A@abot.run,b@x.com', 'a..b@abot.run']) {
         ageRequests();
         const code = await newCode();
         const before = q1('SELECT COUNT(*) c FROM provision_requests').c;
