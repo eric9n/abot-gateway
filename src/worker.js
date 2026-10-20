@@ -824,7 +824,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
             result: {
               protocolVersion: "2024-11-05",
               capabilities: { tools: {} },
-              serverInfo: { name: "aBot", version: "1.0.0" },
+              serverInfo: { name: "aBot", version: "1.1.0" },
             },
           });
         }
