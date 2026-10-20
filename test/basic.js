@@ -1,5 +1,5 @@
 // 基础测试：验证 worker.js 语法、关键逻辑，以及 Service Binding 代理行为
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { execSync } from 'child_process';
 import worker from '../src/worker.js';
 
@@ -114,8 +114,9 @@ console.log('7b. wrangler.toml 与代码一致（部署构建产物、binding、
   const routed = [...workerSrc.matchAll(/"\/[a-z0-9]+\/": "(BACKEND_[A-Z0-9]+)"/g)].map((m) => m[1]);
   if (routed.length !== 6) { console.error('   ✗ ROUTES 应有 6 个后端，实际 ' + routed.length); process.exit(1); }
   for (const b of routed) if (!toml.includes(`binding = "${b}"`)) { console.error('   ✗ wrangler.toml 缺少 binding ' + b); process.exit(1); }
-  const ci = readFileSync('.github/workflows/ci.yml', 'utf8');
-  if (!ci.includes('deploy --config wrangler.toml') || ci.indexOf('node build.js', ci.indexOf('deploy:')) < 0) {
+  // CI 工作流在 db9bef0 暂停删除；存在时才校验其部署步骤
+  const ci = existsSync('.github/workflows/ci.yml') ? readFileSync('.github/workflows/ci.yml', 'utf8') : null;
+  if (ci !== null && (!ci.includes('deploy --config wrangler.toml') || ci.indexOf('node build.js', ci.indexOf('deploy:')) < 0)) {
     console.error('   ✗ CI 部署应先构建再用 wrangler.toml'); process.exit(1);
   }
 }
