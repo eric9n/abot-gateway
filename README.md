@@ -1,6 +1,6 @@
 # aBot Gateway
 
-统一 MCP 网关，聚合 mail/data/health/rules/secrets/sms 六个后端服务。
+统一 MCP 网关，聚合 mail/data/health/rules/secrets/air724 六个后端服务。
 
 ## 开发
 
@@ -27,7 +27,9 @@ CI 先 `node build.js` 生成 `dist/worker.js`（把 `src/admin.js` 嵌进 admin
 | `/health/` | `BACKEND_HEALTH` | `abot-health` |
 | `/rules/` | `BACKEND_RULES` | `abot-rules` |
 | `/secrets/` | `BACKEND_SECRETS` | `abot-secrets` |
-| `/sms/` | `BACKEND_SMS` | `abot-sms` |
+| `/air724/` | `BACKEND_AIR724` | `air724-relay`（entrypoint `AbotBackend`） |
+
+air724：MCP 工具统一加 `air724_` 前缀（如 `air724_send_sms`、`air724_call_place`、`air724_reboot`），取代已下线的 `sms_*`（abot-sms / air-broker）。binding 指向 air724 Worker 的命名入口 `AbotBackend`，它只认 `X-Abot-Owner-Email` 是否在 `ABOT_OWNER_EMAILS` 里（在 Cloudflare 后台设置，不进仓库）。`air724_reboot` 必须带 `confirm: true`，调用前要先征得用户同意。
 
 Binding 未配置时返回 `502`，并带上缺少哪个 binding。后端抛错或返回 5xx 时返回 `502 {"error":"backend_unavailable","service":"<名>"}`，不透传后端原文。
 

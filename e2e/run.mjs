@@ -34,7 +34,7 @@ const BACKENDS = [
   { name: "abot-health", config: "wrangler.health.toml", port: 8783, inspector: 9233, route: "/health/status", path: "/status", search: "" },
   { name: "abot-rules", config: "wrangler.rules.toml", port: 8784, inspector: 9234, route: "/rules/list", path: "/list", search: "" },
   { name: "abot-secrets", config: "wrangler.secrets.toml", port: 8785, inspector: 9235, route: "/secrets/names", path: "/names", search: "" },
-  { name: "abot-sms", config: "wrangler.sms.toml", port: 8786, inspector: 9236, route: "/sms/status", path: "/status", search: "" },
+  { name: "air724-relay", config: "wrangler.air724.toml", port: 8786, inspector: 9236, route: "/air724/status", path: "/status", search: "" },
 ];
 
 const children = [];

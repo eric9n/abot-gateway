@@ -1,5 +1,5 @@
 // 基础测试：验证 worker.js 语法、关键逻辑，以及 Service Binding 代理行为
-import { readFileSync } from 'fs';
+import { existsSync, readFileSync } from 'fs';
 import { execSync } from 'child_process';
 import worker from '../src/worker.js';
 
@@ -91,7 +91,9 @@ for (const [s, name] of bad) {
 console.log('   ✓ 无危险模式');
 
 console.log('7. 检查 Service Binding...');
-const bindings = ['BACKEND_DATA', 'BACKEND_MAIL', 'BACKEND_HEALTH', 'BACKEND_RULES', 'BACKEND_SECRETS', 'BACKEND_SMS'];
+const bindings = ['BACKEND_DATA', 'BACKEND_MAIL', 'BACKEND_HEALTH', 'BACKEND_RULES', 'BACKEND_SECRETS', 'BACKEND_AIR724'];
+if (workerSrc.includes('BACKEND_SMS') || /prefix: "sms"/.test(workerSrc)) { console.error('   ✗ 旧 sms 路径未移除'); process.exit(1); }
+{ const t = readFileSync('wrangler.toml', 'utf8'); if (!/binding = "BACKEND_AIR724"\nservice = "air724-relay"\nentrypoint = "AbotBackend"/.test(t) || t.includes('abot-sms')) { console.error('   ✗ wrangler.toml air724 binding 不对'); process.exit(1); } }
 for (const name of bindings) {
   if (!workerSrc.includes(name)) { console.error(`   ✗ 缺少 binding ${name}`); process.exit(1); }
 }
@@ -109,11 +111,12 @@ console.log('7b. wrangler.toml 与代码一致（部署构建产物、binding、
     '{ pattern = "admin.abot.run/*", zone_name = "abot.run" }', '{ pattern = "abot.run/*", zone_name = "abot.run" }',
   ];
   for (const n of need) if (!toml.includes(n)) { console.error('   ✗ wrangler.toml 缺少 ' + n); process.exit(1); }
-  const routed = [...workerSrc.matchAll(/"\/[a-z]+\/": "(BACKEND_[A-Z]+)"/g)].map((m) => m[1]);
+  const routed = [...workerSrc.matchAll(/"\/[a-z0-9]+\/": "(BACKEND_[A-Z0-9]+)"/g)].map((m) => m[1]);
   if (routed.length !== 6) { console.error('   ✗ ROUTES 应有 6 个后端，实际 ' + routed.length); process.exit(1); }
   for (const b of routed) if (!toml.includes(`binding = "${b}"`)) { console.error('   ✗ wrangler.toml 缺少 binding ' + b); process.exit(1); }
-  const ci = readFileSync('.github/workflows/ci.yml', 'utf8');
-  if (!ci.includes('deploy --config wrangler.toml') || ci.indexOf('node build.js', ci.indexOf('deploy:')) < 0) {
+  // CI 工作流在 db9bef0 暂停删除；存在时才校验其部署步骤
+  const ci = existsSync('.github/workflows/ci.yml') ? readFileSync('.github/workflows/ci.yml', 'utf8') : null;
+  if (ci !== null && (!ci.includes('deploy --config wrangler.toml') || ci.indexOf('node build.js', ci.indexOf('deploy:')) < 0)) {
     console.error('   ✗ CI 部署应先构建再用 wrangler.toml'); process.exit(1);
   }
 }
