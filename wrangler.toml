@@ -48,5 +48,6 @@ binding = "BACKEND_SECRETS"
 service = "abot-secrets"
 
 [[services]]
-binding = "BACKEND_SMS"
-service = "abot-sms"
+binding = "BACKEND_AIR724"
+service = "air724-relay"
+entrypoint = "AbotBackend"

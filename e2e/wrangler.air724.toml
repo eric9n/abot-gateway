@@ -1,7 +1,7 @@
-name = "abot-sms"
+name = "air724-relay"
 main = "mock-backend.js"
 compatibility_date = "2024-11-05"
 workers_dev = false
 
 [vars]
-SERVICE_NAME = "abot-sms"
+SERVICE_NAME = "air724-relay"

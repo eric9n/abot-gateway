@@ -5,7 +5,7 @@ const ROUTES = {
   "/health/": "BACKEND_HEALTH",
   "/rules/": "BACKEND_RULES",
   "/secrets/": "BACKEND_SECRETS",
-  "/sms/": "BACKEND_SMS",
+  "/air724/": "BACKEND_AIR724",
 };
 
 function routeServiceName(prefix) {
@@ -786,7 +786,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
           { prefix: "health", binding: ROUTES["/health/"] },
           { prefix: "rules", binding: ROUTES["/rules/"] },
           { prefix: "secrets", binding: ROUTES["/secrets/"] },
-          { prefix: "sms", binding: ROUTES["/sms/"] },
+          { prefix: "air724", binding: ROUTES["/air724/"] },
         ];
         
         async function callBackend(svc, rpcPayload, timeoutMs) {
@@ -908,7 +908,7 @@ ${items || "<p>暂无申请</p>"}</body></html>`,
       }
     }
     if (!route) {
-      return Response.json({ error: "unknown service, use /data/, /mail/, /health/, /rules/, /secrets/, /sms/" }, { status: 404 });
+      return Response.json({ error: "unknown service, use /data/, /mail/, /health/, /rules/, /secrets/, /air724/" }, { status: 404 });
     }
 
     const bindingName = route;
